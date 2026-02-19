@@ -1,0 +1,149 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Category {
+  id          String    @id @default(cuid())
+  name        String
+  slug        String    @unique
+  description String
+  image       String
+  products    Product[]
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+model Product {
+  id          String    @id @default(cuid())
+  name        String
+  slug        String    @unique
+  description String
+  basePrice   Float
+  images      String[]
+  isActive    Boolean   @default(true)
+  category    Category  @relation(fields: [categoryId], references: [id])
+  categoryId  String
+  variants    Variant[]
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+model Variant {
+  id              String   @id @default(cuid())
+  color           String
+  pattern         String
+  stock           Int
+  additionalPrice Float    @default(0)
+  sku             String   @unique
+  isAvailable     Boolean  @default(true)
+  product         Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productId       String
+  orderItems      OrderItem[]
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+model Customer {
+  id          String   @id @default(cuid())
+  name        String
+  email       String   @unique
+  phone       String   @unique
+  address     String
+  city        String
+  state       String
+  pincode     String
+  orders      Order[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Order {
+  id              String      @id @default(cuid())
+  orderNumber     String      @unique
+  status          OrderStatus @default(PENDING)
+  totalAmount     Float
+  paymentMethod   String
+  paymentStatus   PaymentStatus @default(PENDING)
+  upiTransactionId String?
+  trackingCarrier String?
+  trackingNumber  String?
+  trackingUrl     String?
+  shippedAt       DateTime?
+  deliveredAt     DateTime?
+  customer        Customer    @relation(fields: [customerId], references: [id])
+  customerId      String
+  items           OrderItem[]
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+}
+
+model OrderItem {
+  id        String  @id @default(cuid())
+  quantity  Int
+  price     Float
+  order     Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId   String
+  variant   Variant @relation(fields: [variantId], references: [id])
+  variantId String
+}
+
+model AdminUser {
+  id          String   @id @default(cuid())
+  username    String   @unique
+  email       String   @unique
+  passwordHash String
+  role        String   @default("admin")
+  isActive    Boolean  @default(true)
+  lastLogin   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Settings {
+  id          String  @id @default(cuid())
+  storeName   String
+  upiId       String
+  upiName     String
+  currency    String  @default("INR")
+  updatedAt   DateTime @updatedAt
+}
+
+model DeliverySettings {
+  id              String   @id @default(cuid())
+  freeShippingThreshold Float @default(999)
+  defaultShippingCharge Float @default(50)
+  regions         DeliveryRegion[]
+  updatedAt       DateTime @updatedAt
+}
+
+model DeliveryRegion {
+  id              String           @id @default(cuid())
+  pincode         String           @unique
+  city            String
+  state           String
+  shippingCharge  Float
+  isActive        Boolean          @default(true)
+  deliverySettings DeliverySettings @relation(fields: [deliverySettingsId], references: [id])
+  deliverySettingsId String
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PROCESSING
+  SHIPPED
+  DELIVERED
+  CANCELLED
+  REFUNDED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
