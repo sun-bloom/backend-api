@@ -595,11 +595,6 @@ const swaggerSpec = swaggerJsdoc({
   apis: [],
 });
 
-app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
-app.get('/api/openapi.json', (req, res) => {
-  res.json(swaggerSpec);
-});
-
 app.get('/api/health', (req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
@@ -620,6 +615,11 @@ const authenticateToken = (req, res, next) => {
     next();
   });
 };
+
+app.use('/api/docs', authenticateToken, swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+app.get('/api/openapi.json', authenticateToken, (req, res) => {
+  res.json(swaggerSpec);
+});
 
 app.get('/api/categories', async (req, res) => {
   try {
@@ -681,6 +681,24 @@ app.get('/api/products', async (req, res) => {
   } catch (error) {
     console.error('Error fetching products:', error);
     res.status(500).json({ error: 'Failed to fetch products', details: error.message });
+  }
+});
+
+app.get('/api/products/slug/:slug', async (req, res) => {
+  try {
+    const product = await prisma.product.findFirst({
+      where: { slug: req.params.slug },
+      include: {
+        category: true,
+        variants: true
+      }
+    });
+    if (!product) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    res.json(serializeProduct(product));
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch product' });
   }
 });
 
@@ -1091,7 +1109,16 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/api/settings', async (req, res) => {
+app.get('/api/settings', authenticateToken, async (req, res) => {
+  try {
+    const settings = await prisma.settings.findFirst();
+    res.json(mapSettingsForFrontend(settings));
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch settings' });
+  }
+});
+
+app.get('/api/public/settings', async (req, res) => {
   try {
     const settings = await prisma.settings.findFirst();
     res.json(mapSettingsForFrontend(settings));
@@ -1128,7 +1155,7 @@ app.put('/api/settings', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/api/delivery', async (req, res) => {
+app.get('/api/delivery', authenticateToken, async (req, res) => {
   try {
     const settings = await prisma.deliverySettings.findFirst({
       include: { regions: true }
@@ -1279,7 +1306,7 @@ const serializeProduct = (product) => {
   }
 }
 
-app.get('/api/routes', (req, res) => {
+app.get('/api/routes', authenticateToken, (req, res) => {
   res.json({ routes: listRoutes() })
 })
 
