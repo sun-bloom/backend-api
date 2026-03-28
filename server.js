@@ -44,7 +44,7 @@ const orderLimiter = rateLimit({
 app.set('etag', false);
 
 const corsOriginAllowlist = new Set(
-  (process.env.CORS_ORIGINS || '')
+  (process.env.CORS_ORIGINS || 'http://localhost:4321')
     .split(',')
     .map((o) => o.trim())
     .filter(Boolean)
@@ -74,12 +74,6 @@ const cashfreeRoutes = require('./routes/cashfree.routes');
 // ── Cashfree Webhook — handled directly (raw body needed, no router) ────────
 const crypto = require('crypto');
 
-// GET: Cashfree dashboard test ping
-app.get('/api/payments/cashfree/webhook', (req, res) => {
-  console.log('[Cashfree] Webhook test ping (GET)');
-  res.status(200).json({ status: 'ok' });
-});
-
 // POST: actual payment webhook
 app.post('/api/payments/cashfree/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   try {
@@ -89,11 +83,6 @@ app.post('/api/payments/cashfree/webhook', express.raw({ type: '*/*' }), async (
 
     console.log('[Cashfree] Webhook POST received, timestamp:', timestamp);
 
-    // Test ping from Cashfree dashboard — no signature headers
-    if (!timestamp || !signature) {
-      console.log('[Cashfree] Test ping acknowledged');
-      return res.status(200).json({ status: 'ok' });
-    }
 
     // Verify HMAC-SHA256 signature
     const expected = crypto
