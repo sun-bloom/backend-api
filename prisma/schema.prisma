@@ -12,9 +12,24 @@ model Category {
   slug        String    @unique
   description String
   image       String
-  products    Product[]
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
+  products    Product[]
+  subcategories Subcategory[]
+}
+
+model Subcategory {
+  id         String    @id @default(cuid())
+  name       String
+  slug       String
+  categoryId String
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  category   Category  @relation(fields: [categoryId], references: [id])
+  products   Product[]
+
+  @@unique([categoryId, slug])
 }
 
 model Product {
@@ -25,110 +40,128 @@ model Product {
   basePrice   Float
   images      String[]
   isActive    Boolean   @default(true)
-  category    Category  @relation(fields: [categoryId], references: [id])
   categoryId  String
-  variants    Variant[]
+  subcategoryId String?
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
+  category    Category  @relation(fields: [categoryId], references: [id])
+  subcategory Subcategory? @relation(fields: [subcategoryId], references: [id], onDelete: SetNull)
+  variants    Variant[]
 }
 
 model Variant {
-  id              String   @id @default(cuid())
+  id              String      @id @default(cuid())
   color           String
   pattern         String
   stock           Int
-  additionalPrice Float    @default(0)
-  sku             String   @unique
-  isAvailable     Boolean  @default(true)
-  product         Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  additionalPrice Float       @default(0)
+  sku             String      @unique
+  isAvailable     Boolean     @default(true)
   productId       String
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
   orderItems      OrderItem[]
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  product         Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
 }
 
 model Customer {
-  id          String   @id @default(cuid())
-  name        String
-  email       String   @unique
-  phone       String   @unique
-  address     String
-  city        String
-  state       String
-  pincode     String
-  orders      Order[]
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id        String   @id @default(cuid())
+  name      String
+  email     String   @unique
+  phone     String   @unique
+  address   String
+  city      String
+  state     String
+  pincode   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  orders    Order[]
 }
 
 model Order {
-  id              String      @id @default(cuid())
-  orderNumber     String      @unique
-  status          OrderStatus @default(PENDING)
-  totalAmount     Float
-  paymentMethod   String
-  paymentStatus   PaymentStatus @default(PENDING)
+  id               String        @id @default(cuid())
+  orderNumber      String        @unique
+  status           OrderStatus   @default(PENDING)
+  totalAmount      Float
+  paymentMethod    String
+  paymentStatus    PaymentStatus @default(PENDING)
   upiTransactionId String?
-  trackingCarrier String?
-  trackingNumber  String?
-  trackingUrl     String?
-  shippedAt       DateTime?
-  deliveredAt     DateTime?
-  customer        Customer    @relation(fields: [customerId], references: [id])
-  customerId      String
-  items           OrderItem[]
-  createdAt       DateTime    @default(now())
-  updatedAt       DateTime    @updatedAt
+  trackingCarrier  String?
+  trackingNumber   String?
+  trackingUrl      String?
+  shippedAt        DateTime?
+  deliveredAt      DateTime?
+  customerId       String
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  customer         Customer      @relation(fields: [customerId], references: [id])
+  items            OrderItem[]
 }
 
 model OrderItem {
   id        String  @id @default(cuid())
   quantity  Int
   price     Float
-  order     Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
   orderId   String
-  variant   Variant @relation(fields: [variantId], references: [id])
   variantId String
+  order     Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  variant   Variant @relation(fields: [variantId], references: [id])
 }
 
 model AdminUser {
-  id          String   @id @default(cuid())
-  username    String   @unique
-  email       String   @unique
+  id           String    @id @default(cuid())
+  username     String    @unique
+  email        String    @unique
   passwordHash String
-  role        String   @default("admin")
-  isActive    Boolean  @default(true)
-  lastLogin   DateTime?
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  role         String    @default("admin")
+  isActive     Boolean   @default(true)
+  lastLogin    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
 }
 
 model Settings {
-  id          String  @id @default(cuid())
-  storeName   String
-  upiId       String
-  upiName     String
-  currency    String  @default("INR")
-  updatedAt   DateTime @updatedAt
+  id        String   @id @default(cuid())
+  storeName String
+  upiId     String
+  upiName   String
+  currency  String   @default("INR")
+  updatedAt DateTime @updatedAt
 }
 
 model DeliverySettings {
-  id              String   @id @default(cuid())
-  freeShippingThreshold Float @default(999)
-  defaultShippingCharge Float @default(50)
-  regions         DeliveryRegion[]
-  updatedAt       DateTime @updatedAt
+  id                    String           @id @default(cuid())
+  freeShippingThreshold Float            @default(999)
+  defaultShippingCharge Float            @default(50)
+  updatedAt             DateTime         @updatedAt
+  regions               DeliveryRegion[]
 }
 
 model DeliveryRegion {
-  id              String           @id @default(cuid())
-  pincode         String           @unique
-  city            String
-  state           String
-  shippingCharge  Float
-  isActive        Boolean          @default(true)
-  deliverySettings DeliverySettings @relation(fields: [deliverySettingsId], references: [id])
+  id                 String           @id @default(cuid())
+  pincode            String           @unique
+  city               String
+  state              String
+  shippingCharge     Float
+  isActive           Boolean          @default(true)
   deliverySettingsId String
+  deliverySettings   DeliverySettings @relation(fields: [deliverySettingsId], references: [id])
+}
+
+model PincodeZone {
+  id      Int    @id @default(autoincrement())
+  pincode String @unique
+  zoneId  Int
+  Zone    Zone   @relation(fields: [zoneId], references: [id])
+}
+
+model Zone {
+  id             Int           @id @default(autoincrement())
+  name           String
+  deliveryCharge Int
+  estimatedDays  Int
+  codAvailable   Boolean       @default(true)
+  PincodeZone    PincodeZone[]
 }
 
 enum OrderStatus {

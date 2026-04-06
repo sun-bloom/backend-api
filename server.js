@@ -118,6 +118,14 @@ const mapPaymentStatus = (status) => {
   }
 };
 
+const toSlug = (value) => {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+};
+
 const mapOrderForFrontend = (order) => {
   if (!order) return order;
   const customer = order.customer || {};
@@ -625,13 +633,98 @@ app.get('/api/categories', async (req, res) => {
   try {
     console.log('[API] Fetching categories from database...');
     const categories = await prisma.category.findMany({
-      include: { products: true }
+      include: {
+        products: true,
+        subcategories: { orderBy: { name: 'asc' } },
+      }
     });
     console.log('[API] Categories found:', categories.length);
     res.json({ categories, products: categories.flatMap(c => c.products) });
   } catch (error) {
     console.error('[API] Error fetching categories:', error);
     res.status(500).json({ error: 'Failed to fetch categories', details: error.message });
+  }
+});
+
+app.get('/api/subcategories', async (req, res) => {
+  try {
+    const { categoryId, categorySlug } = req.query;
+    const where = {};
+    if (categoryId) where.categoryId = String(categoryId);
+    if (categorySlug) where.category = { slug: String(categorySlug) };
+
+    const subcategories = await prisma.subcategory.findMany({
+      where,
+      include: { category: true },
+      orderBy: { name: 'asc' },
+    });
+
+    res.json({ subcategories });
+  } catch (error) {
+    console.error('[API] Error fetching subcategories:', error);
+    res.status(500).json({ error: 'Failed to fetch subcategories', details: error.message });
+  }
+});
+
+app.get('/api/subcategories/:id', async (req, res) => {
+  try {
+    const subcategory = await prisma.subcategory.findUnique({
+      where: { id: req.params.id },
+      include: { category: true },
+    });
+    if (!subcategory) return res.status(404).json({ error: 'Subcategory not found' });
+    res.json(subcategory);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch subcategory' });
+  }
+});
+
+app.post('/api/subcategories', authenticateToken, async (req, res) => {
+  try {
+    const { name, slug, categoryId } = req.body || {};
+    if (!name || !categoryId) {
+      return res.status(400).json({ error: 'name and categoryId are required' });
+    }
+
+    const subcategory = await prisma.subcategory.create({
+      data: {
+        name: String(name),
+        slug: String(slug || toSlug(name)),
+        categoryId: String(categoryId),
+      },
+    });
+    res.json(subcategory);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to create subcategory', details: error.message });
+  }
+});
+
+app.put('/api/subcategories/:id', authenticateToken, async (req, res) => {
+  try {
+    const { name, slug, categoryId } = req.body || {};
+    const data = {};
+    if (name != null) data.name = String(name);
+    if (slug != null) data.slug = String(slug);
+    if (categoryId != null) data.categoryId = String(categoryId);
+
+    const subcategory = await prisma.subcategory.update({
+      where: { id: req.params.id },
+      data,
+    });
+    res.json(subcategory);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update subcategory', details: error.message });
+  }
+});
+
+app.delete('/api/subcategories/:id', authenticateToken, async (req, res) => {
+  try {
+    await prisma.subcategory.delete({
+      where: { id: req.params.id },
+    });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to delete subcategory', details: error.message });
   }
 });
 
@@ -671,9 +764,18 @@ app.delete('/api/categories/:id', authenticateToken, async (req, res) => {
 
 app.get('/api/products', async (req, res) => {
   try {
+    const { categoryId, categorySlug, subcategoryId, subcategorySlug } = req.query;
+    const where = {};
+    if (categoryId) where.categoryId = String(categoryId);
+    if (categorySlug) where.category = { slug: String(categorySlug) };
+    if (subcategoryId) where.subcategoryId = String(subcategoryId);
+    if (subcategorySlug) where.subcategory = { slug: String(subcategorySlug) };
+
     const products = await prisma.product.findMany({
+      where,
       include: {
         category: true,
+        subcategory: true,
         variants: true
       }
     });
@@ -690,6 +792,7 @@ app.get('/api/products/slug/:slug', async (req, res) => {
       where: { slug: req.params.slug },
       include: {
         category: true,
+        subcategory: true,
         variants: true
       }
     });
@@ -708,6 +811,7 @@ app.get('/api/products/:id', async (req, res) => {
       where: { id: req.params.id },
       include: {
         category: true,
+        subcategory: true,
         variants: true
       }
     });
@@ -722,17 +826,19 @@ app.get('/api/products/:id', async (req, res) => {
 
 app.post('/api/products', authenticateToken, async (req, res) => {
   try {
-    const { variants, category, categoryId, ...productData } = req.body;
+    const { variants, category, categoryId, subcategory, subcategoryId, ...productData } = req.body;
     const product = await prisma.product.create({
       data: {
         ...productData,
         categoryId: categoryId || category,
+        ...(subcategoryId || subcategory ? { subcategoryId: subcategoryId || subcategory } : {}),
         variants: {
           create: variants || []
         }
       },
       include: {
         category: true,
+        subcategory: true,
         variants: true
       }
     });
@@ -744,13 +850,16 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 
 app.put('/api/products/:id', authenticateToken, async (req, res) => {
   try {
-    const { variants, category, categoryId, ...productData } = req.body;
+    const { variants, category, categoryId, subcategory, subcategoryId, ...productData } = req.body;
     
     const product = await prisma.product.update({
       where: { id: req.params.id },
       data: {
         ...productData,
         ...(categoryId || category ? { categoryId: categoryId || category } : {}),
+        ...(subcategoryId !== undefined || subcategory !== undefined
+          ? { subcategoryId: subcategoryId ?? subcategory ?? null }
+          : {}),
         variants: variants ? {
           deleteMany: {},
           create: variants
@@ -758,6 +867,7 @@ app.put('/api/products/:id', authenticateToken, async (req, res) => {
       },
       include: {
         category: true,
+        subcategory: true,
         variants: true
       }
     });
@@ -1295,7 +1405,7 @@ const listRoutes = () => {
 
 const serializeProduct = (product) => {
   if (!product) return product
-  const { category, ...rest } = product
+  const { category, subcategory, ...rest } = product
   return {
     ...rest,
     // Preserve the old contract expected by customer-web: `category` is a string.
@@ -1303,6 +1413,8 @@ const serializeProduct = (product) => {
     category: category?.slug || rest.categoryId,
     // Keep full category details for admin-web/other clients.
     categoryDetails: category || null,
+    subcategory: subcategory?.slug || rest.subcategoryId || null,
+    subcategoryDetails: subcategory || null,
   }
 }
 
