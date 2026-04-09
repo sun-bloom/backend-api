@@ -17,6 +17,7 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
 const AUTH_DEBUG = process.env.DEBUG_AUTH === '1';
+const PUBLIC_DOCS = process.env.PUBLIC_DOCS === '1';
 
 if (!JWT_SECRET) {
   console.error('ERROR: JWT_SECRET environment variable is required');
@@ -408,6 +409,7 @@ const swaggerSpec = swaggerJsdoc({
     tags: [
       { name: 'Auth' },
       { name: 'Categories' },
+      { name: 'Subcategories' },
       { name: 'Products' },
       { name: 'Orders' },
       { name: 'Customers' },
@@ -500,6 +502,100 @@ const swaggerSpec = swaggerJsdoc({
           summary: 'Delete category',
           parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
           responses: { 200: { description: 'Deleted category' } },
+        },
+      },
+      '/api/subcategories': {
+        get: {
+          tags: ['Subcategories'],
+          summary: 'List subcategories',
+          security: [],
+          parameters: [
+            { name: 'categoryId', in: 'query', required: false, schema: { type: 'string' } },
+            { name: 'categorySlug', in: 'query', required: false, schema: { type: 'string' } },
+          ],
+          responses: {
+            200: { description: 'Subcategories list' },
+          },
+        },
+        post: {
+          tags: ['Subcategories'],
+          summary: 'Create subcategory',
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    name: { type: 'string' },
+                    slug: { type: 'string', nullable: true, description: 'Optional; derived from name when omitted' },
+                    categoryId: { type: 'string' },
+                  },
+                  required: ['name', 'categoryId'],
+                },
+                example: {
+                  name: 'Summer Collection',
+                  slug: 'summer-collection',
+                  categoryId: 'ckxyz123',
+                },
+              },
+            },
+          },
+          responses: {
+            200: { description: 'Created subcategory' },
+            400: { description: 'Validation error' },
+            401: { description: 'Unauthorized' },
+          },
+        },
+      },
+      '/api/subcategories/{id}': {
+        get: {
+          tags: ['Subcategories'],
+          summary: 'Get subcategory by id',
+          security: [],
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: {
+            200: { description: 'Subcategory' },
+            404: { description: 'Not found' },
+          },
+        },
+        put: {
+          tags: ['Subcategories'],
+          summary: 'Update subcategory',
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          requestBody: {
+            required: true,
+            content: {
+              'application/json': {
+                schema: {
+                  type: 'object',
+                  properties: {
+                    name: { type: 'string', nullable: true },
+                    slug: { type: 'string', nullable: true },
+                    categoryId: { type: 'string', nullable: true },
+                  },
+                },
+                example: {
+                  name: 'Summer 2026',
+                },
+              },
+            },
+          },
+          responses: {
+            200: { description: 'Updated subcategory' },
+            401: { description: 'Unauthorized' },
+            404: { description: 'Not found' },
+          },
+        },
+        delete: {
+          tags: ['Subcategories'],
+          summary: 'Delete subcategory',
+          parameters: [{ name: 'id', in: 'path', required: true, schema: { type: 'string' } }],
+          responses: {
+            200: { description: 'Deleted subcategory' },
+            401: { description: 'Unauthorized' },
+            404: { description: 'Not found' },
+          },
         },
       },
       '/api/products': {
@@ -624,10 +720,18 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-app.use('/api/docs', authenticateToken, swaggerUi.serve, swaggerUi.setup(swaggerSpec));
-app.get('/api/openapi.json', authenticateToken, (req, res) => {
-  res.json(swaggerSpec);
-});
+if (PUBLIC_DOCS) {
+  console.log('[DOCS] PUBLIC_DOCS=1: exposing /api/docs and /api/openapi.json without auth (local only).');
+  app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+  app.get('/api/openapi.json', (req, res) => {
+    res.json(swaggerSpec);
+  });
+} else {
+  app.use('/api/docs', authenticateToken, swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+  app.get('/api/openapi.json', authenticateToken, (req, res) => {
+    res.json(swaggerSpec);
+  });
+}
 
 app.get('/api/categories', async (req, res) => {
   try {
@@ -719,9 +823,26 @@ app.put('/api/subcategories/:id', authenticateToken, async (req, res) => {
 
 app.delete('/api/subcategories/:id', authenticateToken, async (req, res) => {
   try {
-    await prisma.subcategory.delete({
-      where: { id: req.params.id },
+    const subcategoryId = String(req.params.id);
+
+    const existingSubcategory = await prisma.subcategory.findUnique({
+      where: { id: subcategoryId },
     });
+
+    if (!existingSubcategory) {
+      return res.status(404).json({ error: 'Subcategory not found' });
+    }
+
+    await prisma.$transaction([
+      prisma.product.updateMany({
+        where: { subcategoryId },
+        data: { subcategoryId: null },
+      }),
+      prisma.subcategory.delete({
+        where: { id: subcategoryId },
+      }),
+    ]);
+
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete subcategory', details: error.message });
@@ -753,12 +874,32 @@ app.put('/api/categories/:id', authenticateToken, async (req, res) => {
 
 app.delete('/api/categories/:id', authenticateToken, async (req, res) => {
   try {
-    await prisma.category.delete({
-      where: { id: req.params.id }
+    const categoryId = String(req.params.id);
+
+    const existingCategory = await prisma.category.findUnique({
+      where: { id: categoryId },
+      select: { id: true },
     });
+
+    if (!existingCategory) {
+      return res.status(404).json({ error: 'Category not found' });
+    }
+
+    await prisma.$transaction([
+      prisma.product.deleteMany({
+        where: { categoryId },
+      }),
+      prisma.subcategory.deleteMany({
+        where: { categoryId },
+      }),
+      prisma.category.delete({
+        where: { id: categoryId },
+      }),
+    ]);
+
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to delete category' });
+    res.status(500).json({ error: 'Failed to delete category', details: error.message });
   }
 });
 

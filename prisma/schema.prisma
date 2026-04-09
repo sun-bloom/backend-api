@@ -47,6 +47,8 @@ model Product {
   category    Category  @relation(fields: [categoryId], references: [id])
   subcategory Subcategory? @relation(fields: [subcategoryId], references: [id], onDelete: SetNull)
   variants    Variant[]
+
+  @@index([subcategoryId])
 }
 
 model Variant {
