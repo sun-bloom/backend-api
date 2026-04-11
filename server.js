@@ -14,6 +14,7 @@ const connectionString = process.env.DATABASE_URL;
 const adapter = new PrismaNeon({ connectionString });
 const prisma = new PrismaClient({ adapter });
 const app = express();
+app.locals.prisma = prisma; // shared with route files
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
 const AUTH_DEBUG = process.env.DEBUG_AUTH === '1';
@@ -43,7 +44,7 @@ const orderLimiter = rateLimit({
 app.set('etag', false);
 
 const corsOriginAllowlist = new Set(
-  (process.env.CORS_ORIGINS || '')
+  (process.env.CORS_ORIGINS || 'http://localhost:4321')
     .split(',')
     .map((o) => o.trim())
     .filter(Boolean)
@@ -68,9 +69,67 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
+// ── Cashfree: webhook must be mounted BEFORE express.json() (needs raw body) ──
+const cashfreeRoutes = require('./routes/cashfree.routes');
+// ── Cashfree Webhook — handled directly (raw body needed, no router) ────────
+const crypto = require('crypto');
+
+// POST: actual payment webhook
+app.post('/api/payments/cashfree/webhook', express.raw({ type: '*/*' }), async (req, res) => {
+  try {
+    const timestamp = req.headers['x-webhook-timestamp'];
+    const signature = req.headers['x-webhook-signature'];
+    const rawBody   = req.body?.toString('utf8') || '';
+
+    console.log('[Cashfree] Webhook POST received, timestamp:', timestamp);
+
+
+    // Verify HMAC-SHA256 signature
+    const expected = crypto
+      .createHmac('sha256', process.env.CASHFREE_SECRET_KEY)
+      .update(`${timestamp}${rawBody}`)
+      .digest('base64');
+
+    if (expected !== signature) {
+      console.warn('[Cashfree] Signature mismatch');
+      return res.status(401).json({ message: 'Invalid signature' });
+    }
+
+    const event     = JSON.parse(rawBody);
+    const { type, data } = event;
+    const cfOrderId = data?.order?.order_id;
+
+    console.log(`[Cashfree] Event: ${type} — order: ${cfOrderId}`);
+
+    if (type === 'PAYMENT_SUCCESS_WEBHOOK' && cfOrderId) {
+      await prisma.order.updateMany({
+        where: { upiTransactionId: cfOrderId },
+        data:  { paymentStatus: 'PAID', status: 'CONFIRMED' },
+      });
+      console.log(`[Cashfree] Order ${cfOrderId} marked PAID`);
+    }
+
+    if (type === 'PAYMENT_FAILED_WEBHOOK' && cfOrderId) {
+      await prisma.order.updateMany({
+        where: { upiTransactionId: cfOrderId },
+        data:  { paymentStatus: 'FAILED' },
+      });
+      console.log(`[Cashfree] Order ${cfOrderId} marked FAILED`);
+    }
+
+    res.status(200).json({ status: 'ok' });
+  } catch (err) {
+    console.error('[Cashfree] Webhook error:', err);
+    res.status(200).json({ status: 'ok' }); // always 200 so Cashfree doesn't retry
+  }
+});
+
 app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// ── Cashfree: remaining routes (create-order, confirm-order) use JSON body ──
+app.use('/api/payments/cashfree', cashfreeRoutes);
 // Express 5 + path-to-regexp does not accept "*" as a path pattern here.
 // Use a regex to enable CORS preflight handling for all routes.
 app.options(/.*/, cors(corsOptions));
@@ -840,6 +899,40 @@ app.get('/api/orders/track', trackingLimiter, async (req, res) => {
   } catch (error) {
     console.error('Track order error:', error);
     res.status(500).json({ error: 'Failed to track order' });
+  }
+});
+
+// Get single order by order number (public — no auth needed)
+app.get('/api/orders/by-number/:orderNumber', trackingLimiter, async (req, res) => {
+  try {
+    const { orderNumber } = req.params;
+
+    if (!orderNumber) {
+      return res.status(400).json({ error: 'Order number is required' });
+    }
+
+    const order = await prisma.order.findFirst({
+      where: { orderNumber },
+      include: {
+        customer: true,
+        items: {
+          include: {
+            variant: {
+              include: { product: true }
+            }
+          }
+        }
+      }
+    });
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    res.json(mapOrderForFrontend(order));
+  } catch (error) {
+    console.error('Fetch order by number error:', error);
+    res.status(500).json({ error: 'Failed to fetch order' });
   }
 });
 
