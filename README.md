@@ -48,6 +48,8 @@ npm run db:generate
 npm run db:push
 ```
 
+⚠️ If Prisma warns about dropping tables you care about (for example `Zone`/`PincodeZone`), you are pointing `DATABASE_URL`/`DIRECT_URL` at a database that contains extra tables not represented in `prisma/schema.prisma`. Use a dedicated development database/branch, or run `npx prisma db pull` first to bring those tables into the Prisma schema before applying changes.
+
 ### 5. Migrate JSON Data (One-time)
 
 ```bash
@@ -78,17 +80,24 @@ npm start
 Auth responses are sent with `Cache-Control: no-store` and ETags are disabled to prevent `304 Not Modified` responses (which can cause client-side auth bugs on refresh).
 
 ### Products
-- `GET /api/products` - List all products
+- `GET /api/products` - List all products (optional filters: `categoryId`, `categorySlug`, `subcategoryId`, `subcategorySlug`)
 - `GET /api/products/:id` - Get single product
 - `POST /api/products` - Create product (requires auth)
 - `PUT /api/products/:id` - Update product (requires auth)
 - `DELETE /api/products/:id` - Delete product (requires auth)
 
 ### Categories
-- `GET /api/categories` - List all categories with products
+- `GET /api/categories` - List all categories with products and subcategories
 - `POST /api/categories` - Create category (requires auth)
 - `PUT /api/categories/:id` - Update category (requires auth)
 - `DELETE /api/categories/:id` - Delete category (requires auth)
+
+### Subcategories
+- `GET /api/subcategories` - List subcategories (optional filters: `categoryId`, `categorySlug`)
+- `GET /api/subcategories/:id` - Get a subcategory
+- `POST /api/subcategories` - Create subcategory (requires auth)
+- `PUT /api/subcategories/:id` - Update subcategory (requires auth)
+- `DELETE /api/subcategories/:id` - Delete subcategory (requires auth; products keep working with `subcategoryId` set to `null`)
 
 ### Orders
 - `GET /api/orders` - List all orders (requires auth)
@@ -133,6 +142,12 @@ npm run db:migrate -- --name your_migration_name
 # Reset database (careful!)
 npx prisma migrate reset
 ```
+
+## Local Database Safety
+Prefer using a dedicated local/dev database for `DIRECT_URL`/`DATABASE_URL`. Avoid running `npm run db:push` or `npm run db:migrate` against a production database or any database that contains legacy tables you want to preserve. If you must use an existing database and Prisma suggests dropping non-empty tables, stop and either:
+
+- switch `DATABASE_URL`/`DIRECT_URL` to a clean dev database/branch, then run `npm run db:migrate`, or
+- run `npx prisma db pull` to sync `prisma/schema.prisma` to the database, then re-apply schema changes and generate a migration that does not drop your data.
 
 ## Default Admin Credentials
 
