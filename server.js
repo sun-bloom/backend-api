@@ -858,6 +858,12 @@ app.post('/api/subcategories', authenticateToken, async (req, res) => {
     });
     res.json(subcategory);
   } catch (error) {
+    if (error.code === 'P2002') {
+      return res.status(409).json({ error: 'Subcategory slug already exists in this category' });
+    }
+    if (error.code === 'P2003') {
+      return res.status(400).json({ error: 'Invalid categoryId' });
+    }
     res.status(500).json({ error: 'Failed to create subcategory', details: error.message });
   }
 });
@@ -876,6 +882,15 @@ app.put('/api/subcategories/:id', authenticateToken, async (req, res) => {
     });
     res.json(subcategory);
   } catch (error) {
+    if (error.code === 'P2025') {
+      return res.status(404).json({ error: 'Subcategory not found' });
+    }
+    if (error.code === 'P2002') {
+      return res.status(409).json({ error: 'Subcategory slug already exists in this category' });
+    }
+    if (error.code === 'P2003') {
+      return res.status(400).json({ error: 'Invalid categoryId' });
+    }
     res.status(500).json({ error: 'Failed to update subcategory', details: error.message });
   }
 });
@@ -910,24 +925,50 @@ app.delete('/api/subcategories/:id', authenticateToken, async (req, res) => {
 
 app.post('/api/categories', authenticateToken, async (req, res) => {
   try {
+    const { name, slug, description, image } = req.body || {};
+    if (!name) {
+      return res.status(400).json({ error: 'name is required' });
+    }
+
     const category = await prisma.category.create({
-      data: req.body
+      data: {
+        name: String(name),
+        slug: String(slug || toSlug(name)),
+        description: String(description || ''),
+        image: String(image || ''),
+      },
     });
     res.json(category);
   } catch (error) {
-    res.status(500).json({ error: 'Failed to create category' });
+    if (error.code === 'P2002') {
+      return res.status(409).json({ error: 'Category slug already exists' });
+    }
+    res.status(500).json({ error: 'Failed to create category', details: error.message });
   }
 });
 
 app.put('/api/categories/:id', authenticateToken, async (req, res) => {
   try {
+    const { name, slug, description, image } = req.body || {};
+    const data = {};
+    if (name != null) data.name = String(name);
+    if (slug != null) data.slug = String(slug);
+    if (description != null) data.description = String(description);
+    if (image != null) data.image = String(image);
+
     const category = await prisma.category.update({
       where: { id: req.params.id },
-      data: req.body
+      data,
     });
     res.json(category);
   } catch (error) {
-    res.status(500).json({ error: 'Failed to update category' });
+    if (error.code === 'P2025') {
+      return res.status(404).json({ error: 'Category not found' });
+    }
+    if (error.code === 'P2002') {
+      return res.status(409).json({ error: 'Category slug already exists' });
+    }
+    res.status(500).json({ error: 'Failed to update category', details: error.message });
   }
 });
 
