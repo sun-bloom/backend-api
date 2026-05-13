@@ -5,7 +5,7 @@ const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const swaggerJsdoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
-const { PrismaClient } = require('@prisma/client');
+const { PrismaClient, Prisma } = require('@prisma/client');
 const { PrismaNeon } = require('@prisma/adapter-neon');
 const { neon } = require('@neondatabase/serverless');
 require('dotenv').config();
@@ -1044,7 +1044,32 @@ app.post('/api/products', authenticateToken, async (req, res) => {
     });
     res.json(serializeProduct(product));
   } catch (error) {
-    res.status(500).json({ error: 'Failed to create product' });
+    // Give actionable errors to the frontend (ex: unique slug/sku collisions)
+    console.error('Error creating product:', {
+      message: error?.message,
+      code: error?.code,
+      meta: error?.meta,
+    });
+
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      // P2002 = Unique constraint failed
+      if (error.code === 'P2002') {
+        return res.status(409).json({
+          error: 'Unique constraint failed',
+          fields: error?.meta?.target || null,
+          details: 'A product slug or variant SKU already exists. Use a different value.'
+        });
+      }
+      // P2003 = Foreign key constraint failed
+      if (error.code === 'P2003') {
+        return res.status(400).json({
+          error: 'Invalid reference',
+          details: 'categoryId (or other referenced id) is invalid.'
+        });
+      }
+    }
+
+    res.status(500).json({ error: 'Failed to create product', details: error?.message });
   }
 });
 
