@@ -1027,6 +1027,18 @@ app.get('/api/products/:id', async (req, res) => {
 app.post('/api/products', authenticateToken, async (req, res) => {
   try {
     const { variants, category, categoryId, subcategory, subcategoryId, ...productData } = req.body;
+
+    // Basic validation: each variant must have >= 1 image URL
+    if (Array.isArray(variants)) {
+      for (const v of variants) {
+        if (!v?.sku) {
+          return res.status(400).json({ error: 'Each variant must have a sku' });
+        }
+        if (!Array.isArray(v?.images) || v.images.length < 1) {
+          return res.status(400).json({ error: `Variant ${v.sku} must have at least 1 image` });
+        }
+      }
+    }
     const product = await prisma.product.create({
       data: {
         ...productData,
@@ -1076,27 +1088,105 @@ app.post('/api/products', authenticateToken, async (req, res) => {
 app.put('/api/products/:id', authenticateToken, async (req, res) => {
   try {
     const { variants, category, categoryId, subcategory, subcategoryId, ...productData } = req.body;
-    
+
+    const productId = req.params.id
+
+    // If variants are being updated, we preserve variant IDs by upserting by SKU.
+    // Deletions are treated as SOFT delete: set isAvailable=false and stock=0.
+    if (Array.isArray(variants)) {
+      for (const v of variants) {
+        if (!v?.sku) {
+          return res.status(400).json({ error: 'Each variant must have a sku' });
+        }
+        if (!Array.isArray(v?.images) || v.images.length < 1) {
+          return res.status(400).json({ error: `Variant ${v.sku} must have at least 1 image` });
+        }
+      }
+
+      const incomingSkus = variants.map((v) => v.sku)
+
+      // Prevent SKU collisions across products (sku is globally unique in schema).
+      const existingBySku = await prisma.variant.findMany({
+        where: { sku: { in: incomingSkus } },
+        select: { sku: true, productId: true },
+      })
+      const foreign = existingBySku.find((v) => v.productId !== productId)
+      if (foreign) {
+        return res
+          .status(400)
+          .json({ error: `SKU ${foreign.sku} already exists on another product` })
+      }
+
+      const [updatedProduct] = await prisma.$transaction([
+        prisma.product.update({
+          where: { id: productId },
+          data: {
+            ...productData,
+            ...(categoryId || category ? { categoryId: categoryId || category } : {}),
+            ...(subcategoryId !== undefined || subcategory !== undefined
+              ? { subcategoryId: subcategoryId ?? subcategory ?? null }
+              : {}),
+            variants: {
+              upsert: variants.map((v) => ({
+                where: { sku: v.sku },
+                update: {
+                  color: v.color,
+                  pattern: v.pattern,
+                  stock: v.stock,
+                  additionalPrice: v.additionalPrice,
+                  images: v.images,
+                  isAvailable: v.isAvailable,
+                },
+                create: {
+                  color: v.color,
+                  pattern: v.pattern,
+                  stock: v.stock,
+                  additionalPrice: v.additionalPrice,
+                  sku: v.sku,
+                  images: v.images,
+                  isAvailable: v.isAvailable ?? true,
+                },
+              })),
+            },
+          },
+          include: {
+            category: true,
+            subcategory: true,
+            variants: true,
+          },
+        }),
+        prisma.variant.updateMany({
+          where: {
+            productId,
+            sku: { notIn: incomingSkus },
+          },
+          data: {
+            isAvailable: false,
+            stock: 0,
+          },
+        }),
+      ])
+
+      return res.json(serializeProduct(updatedProduct))
+    }
+
+    // If variants are not part of this request, only update product fields.
     const product = await prisma.product.update({
-      where: { id: req.params.id },
+      where: { id: productId },
       data: {
         ...productData,
         ...(categoryId || category ? { categoryId: categoryId || category } : {}),
         ...(subcategoryId !== undefined || subcategory !== undefined
           ? { subcategoryId: subcategoryId ?? subcategory ?? null }
           : {}),
-        variants: variants ? {
-          deleteMany: {},
-          create: variants
-        } : undefined
       },
       include: {
         category: true,
         subcategory: true,
-        variants: true
-      }
-    });
-    res.json(serializeProduct(product));
+        variants: true,
+      },
+    })
+    res.json(serializeProduct(product))
   } catch (error) {
     res.status(500).json({ error: 'Failed to update product' });
   }

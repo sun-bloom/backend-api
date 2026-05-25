@@ -58,6 +58,7 @@ model Variant {
   stock           Int
   additionalPrice Float       @default(0)
   sku             String      @unique
+  images          String[]
   isAvailable     Boolean     @default(true)
   productId       String
   createdAt       DateTime    @default(now())
