@@ -157,8 +157,9 @@ router.post('/create-order', async (req, res) => {
         customer_phone: customer.phone,
       },
       order_meta: {
-        return_url: `${process.env.FRONTEND_URL}/order/pending?cf_order_id=${cfOrderId}`,
-        notify_url: `${process.env.SITE_URL}/api/payments/cashfree/webhook`,
+        return_url: `${process.env.FRONTEND_URL}/order/pending?cf_order_id=${cfOrderId}`, // redirect to success page in frontend 
+        notify_url: `${process.env.SITE_URL}/api/payments/cashfree/webhook`, // update the status to db
+        payment_methods: "cc,dc,upi"
       },
       order_note: `Fashion Store — ${cartItems.length} item(s)`,
     };
@@ -209,7 +210,7 @@ router.post('/confirm-order', async (req, res) => {
         try {
           const { data: paymentsData } = await cf.get(`/orders/${cashfreeOrderId}/payments`);
           const payments = Array.isArray(paymentsData) ? paymentsData : [];
-          const latest   = payments[payments.length - 1];
+          const latest   = payments[0];
           if (latest?.payment_status === 'SUCCESS') cfStatus = 'PAID';
         } catch (e) { /* no payments yet */ }
       }

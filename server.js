@@ -1117,8 +1117,16 @@ app.put('/api/products/:id', authenticateToken, async (req, res) => {
           .json({ error: `SKU ${foreign.sku} already exists on another product` })
       }
 
-      const [updatedProduct] = await prisma.$transaction([
-        prisma.product.update({
+      // Classify removed variants: hard-delete if no orders, soft-delete if they have order history.
+      const removedVariants = await prisma.variant.findMany({
+        where: { productId, sku: { notIn: incomingSkus } },
+        select: { id: true, _count: { select: { orderItems: true } } },
+      })
+      const toHardDeleteIds = removedVariants.filter(v => v._count.orderItems === 0).map(v => v.id)
+      const toSoftDeleteIds = removedVariants.filter(v => v._count.orderItems > 0).map(v => v.id)
+
+      await prisma.$transaction(async (tx) => {
+        await tx.product.update({
           where: { id: productId },
           data: {
             ...productData,
@@ -1149,24 +1157,22 @@ app.put('/api/products/:id', authenticateToken, async (req, res) => {
               })),
             },
           },
-          include: {
-            category: true,
-            subcategory: true,
-            variants: true,
-          },
-        }),
-        prisma.variant.updateMany({
-          where: {
-            productId,
-            sku: { notIn: incomingSkus },
-          },
-          data: {
-            isAvailable: false,
-            stock: 0,
-          },
-        }),
-      ])
+        })
+        if (toHardDeleteIds.length > 0) {
+          await tx.variant.deleteMany({ where: { id: { in: toHardDeleteIds } } })
+        }
+        if (toSoftDeleteIds.length > 0) {
+          await tx.variant.updateMany({
+            where: { id: { in: toSoftDeleteIds } },
+            data: { isAvailable: false, stock: 0 },
+          })
+        }
+      })
 
+      const updatedProduct = await prisma.product.findUnique({
+        where: { id: productId },
+        include: { category: true, subcategory: true, variants: true },
+      })
       return res.json(serializeProduct(updatedProduct))
     }
 
