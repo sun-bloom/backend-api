@@ -1,5 +1,6 @@
 generator client {
-  provider = "prisma-client-js"
+  provider   = "prisma-client-js"
+  engineType = "binary"
 }
 
 datasource db {
@@ -10,6 +11,7 @@ model Category {
   id          String    @id @default(cuid())
   name        String
   slug        String    @unique
+  categoryNumber String   @unique
   description String
   image       String
   createdAt   DateTime  @default(now())
@@ -40,6 +42,7 @@ model Product {
   basePrice   Float
   images      String[]
   isActive    Boolean   @default(true)
+  productNumber String? @unique
   categoryId  String
   subcategoryId String?
   createdAt   DateTime  @default(now())
@@ -57,6 +60,7 @@ model Variant {
   pattern         String
   stock           Int
   additionalPrice Float       @default(0)
+  variantNumber   String?
   sku             String      @unique
   images          String[]
   isAvailable     Boolean     @default(true)
@@ -68,37 +72,66 @@ model Variant {
 }
 
 model Customer {
-  id        String   @id @default(cuid())
-  name      String
-  email     String   @unique
-  phone     String   @unique
-  address   String
-  city      String
-  state     String
-  pincode   String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-  orders    Order[]
+  id             String         @id @default(cuid())
+  firebaseUid    String?        @unique
+  name           String
+  email          String         @unique
+  phone          String?        @unique
+  whatsappNumber String?
+  address        String?
+  city           String?
+  state          String?
+  pincode        String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  orders         Order[]
+  supportQueries SupportQuery[]
+  consultantRequests OrderConsultantRequest[]
 }
 
 model Order {
-  id               String        @id @default(cuid())
-  orderNumber      String        @unique
-  status           OrderStatus   @default(PENDING)
-  totalAmount      Float
-  paymentMethod    String
-  paymentStatus    PaymentStatus @default(PENDING)
-  upiTransactionId String?
-  trackingCarrier  String?
-  trackingNumber   String?
-  trackingUrl      String?
-  shippedAt        DateTime?
-  deliveredAt      DateTime?
-  customerId       String
-  createdAt        DateTime      @default(now())
-  updatedAt        DateTime      @updatedAt
-  customer         Customer      @relation(fields: [customerId], references: [id])
-  items            OrderItem[]
+  id                String        @id @default(cuid())
+  orderNumber       String        @unique
+  status            OrderStatus   @default(PENDING)
+  totalAmount       Float
+  subtotal          Float?
+  deliveryCharge    Float?
+  deliveryAddress   String?
+  city              String?
+  state             String?
+  pincode           String?
+  deliveryRegionId  String?
+  paymentMethod     String
+  paymentStatus     PaymentStatus @default(PENDING)
+  upiTransactionId  String?
+  trackingCarrier   String?
+  trackingNumber    String?
+  trackingUrl       String?
+  trackingRequested Boolean       @default(false)
+  whatsappNumber    String?
+  shippedAt         DateTime?
+  deliveredAt       DateTime?
+  customerId        String
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  customer          Customer      @relation(fields: [customerId], references: [id])
+  items             OrderItem[]
+  deliveryRegion    DeliveryRegion? @relation(fields: [deliveryRegionId], references: [id], onDelete: SetNull)
+}
+
+model SupportQuery {
+  id             String    @id @default(cuid())
+  customerId     String?
+  name           String
+  phone          String
+  whatsappNumber String?
+  email          String
+  queryType      String
+  description    String
+  status         String    @default("OPEN")
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  customer       Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
 }
 
 model OrderItem {
@@ -113,9 +146,10 @@ model OrderItem {
 
 model AdminUser {
   id           String    @id @default(cuid())
+  firebaseUid  String?   @unique
   username     String    @unique
   email        String    @unique
-  passwordHash String
+  passwordHash String?
   role         String    @default("admin")
   isActive     Boolean   @default(true)
   lastLogin    DateTime?
@@ -142,13 +176,41 @@ model DeliverySettings {
 
 model DeliveryRegion {
   id                 String           @id @default(cuid())
-  pincode            String           @unique
+  regionName         String?
+  pincode            String?
+  pincodeStart       String?
+  pincodeEnd         String?
   city               String
-  state              String
+  state              String?
   shippingCharge     Float
   isActive           Boolean          @default(true)
   deliverySettingsId String
   deliverySettings   DeliverySettings @relation(fields: [deliverySettingsId], references: [id])
+  orders             Order[]
+}
+
+model OrderConsultantRequest {
+  id              String   @id @default(cuid())
+  customerId      String?
+  name            String
+  phone           String
+  whatsappNumber  String?
+  email           String
+  address         String
+  city            String
+  state           String
+  pincode         String
+  cartItems       Json?
+  subtotal        Float?
+  requestedRegion String?
+  status          String   @default("NEW")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  customer        Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([pincode])
 }
 
 model PincodeZone {

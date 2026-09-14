@@ -6,12 +6,16 @@ const rateLimit = require('express-rate-limit');
 const swaggerJsdoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
 const { PrismaClient, Prisma } = require('@prisma/client');
-const { PrismaNeon } = require('@prisma/adapter-neon');
-const { neon } = require('@neondatabase/serverless');
+const { Pool } = require('pg');
+const { PrismaPg } = require('@prisma/adapter-pg');
 require('dotenv').config();
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
-const connectionString = process.env.DATABASE_URL;
-const adapter = new PrismaNeon({ connectionString });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+});
+const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 const app = express();
 app.locals.prisma = prisma; // shared with route files
@@ -44,12 +48,18 @@ const orderLimiter = rateLimit({
 // Prevent conditional GET (304 Not Modified) behavior caused by ETags.
 app.set('etag', false);
 
-const corsOriginAllowlist = new Set(
-  (process.env.CORS_ORIGINS || 'http://localhost:4321')
-    .split(',')
-    .map((o) => o.trim())
-    .filter(Boolean)
-);
+const configuredOrigins = [
+  ...(process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',') : []),
+  process.env.FRONTEND_URL,
+  process.env.ADMIN_FRONTEND_URL,
+  'http://localhost:4321',
+  'http://localhost:3000',
+  'http://localhost:5173',
+]
+  .filter(Boolean)
+  .map((o) => o.trim().replace(/\/$/, ''));
+
+const corsOriginAllowlist = new Set(configuredOrigins);
 
 const isCorsOriginAllowed = (origin) => {
   // Allow non-browser requests (no Origin header) like curl/health checks.
@@ -70,8 +80,13 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
+// ── Health Endpoint (Render & Uptime Monitoring) ───────────────────────────
+app.get('/health', (req, res) => {
+  res.status(200).json({ ok: true, timestamp: new Date().toISOString() });
+});
+
 // ── Cashfree: webhook must be mounted BEFORE express.json() (needs raw body) ──
-const cashfreeRoutes = require('./routes/cashfree.routes');
+const { router: cashfreeRoutes, confirmOrderPayment } = require('./routes/cashfree.routes');
 // ── Cashfree Webhook — handled directly (raw body needed, no router) ────────
 const crypto = require('crypto');
 
@@ -82,8 +97,15 @@ app.post('/api/payments/cashfree/webhook', express.raw({ type: '*/*' }), async (
     const signature = req.headers['x-webhook-signature'];
     const rawBody   = req.body?.toString('utf8') || '';
 
-    console.log('[Cashfree] Webhook POST received, timestamp:', timestamp);
+    if (!process.env.CASHFREE_SECRET_KEY) {
+      console.error('[Cashfree Webhook] CASHFREE_SECRET_KEY not configured on server.');
+      return res.status(500).json({ message: 'Server configuration error' });
+    }
 
+    if (!timestamp || !signature) {
+      console.warn('[Cashfree Webhook] Missing signature headers');
+      return res.status(401).json({ message: 'Missing signature' });
+    }
 
     // Verify HMAC-SHA256 signature
     const expected = crypto
@@ -92,36 +114,40 @@ app.post('/api/payments/cashfree/webhook', express.raw({ type: '*/*' }), async (
       .digest('base64');
 
     if (expected !== signature) {
-      console.warn('[Cashfree] Signature mismatch');
+      console.warn('[Cashfree Webhook] Signature mismatch');
       return res.status(401).json({ message: 'Invalid signature' });
     }
 
-    const event     = JSON.parse(rawBody);
+    let event;
+    try {
+      event = JSON.parse(rawBody);
+    } catch (parseErr) {
+      console.warn('[Cashfree Webhook] Invalid JSON payload');
+      return res.status(400).json({ message: 'Invalid payload' });
+    }
+
     const { type, data } = event;
     const cfOrderId = data?.order?.order_id;
 
-    console.log(`[Cashfree] Event: ${type} — order: ${cfOrderId}`);
+    console.log(`[Cashfree Webhook] Event: ${type} — order: ${cfOrderId}`);
 
     if (type === 'PAYMENT_SUCCESS_WEBHOOK' && cfOrderId) {
-      await prisma.order.updateMany({
-        where: { upiTransactionId: cfOrderId },
-        data:  { paymentStatus: 'PAID', status: 'CONFIRMED' },
-      });
-      console.log(`[Cashfree] Order ${cfOrderId} marked PAID`);
+      const confirmation = await confirmOrderPayment(prisma, cfOrderId);
+      console.log(`[Cashfree Webhook] Order ${cfOrderId} confirmation complete. Already processed: ${confirmation.alreadyProcessed}`);
     }
 
     if (type === 'PAYMENT_FAILED_WEBHOOK' && cfOrderId) {
       await prisma.order.updateMany({
-        where: { upiTransactionId: cfOrderId },
-        data:  { paymentStatus: 'FAILED' },
+        where: { upiTransactionId: cfOrderId, paymentStatus: 'PENDING' },
+        data:  { paymentStatus: 'FAILED', status: 'CANCELLED' },
       });
-      console.log(`[Cashfree] Order ${cfOrderId} marked FAILED`);
+      console.log(`[Cashfree Webhook] Order ${cfOrderId} marked FAILED`);
     }
 
     res.status(200).json({ status: 'ok' });
   } catch (err) {
-    console.error('[Cashfree] Webhook error:', err);
-    res.status(200).json({ status: 'ok' }); // always 200 so Cashfree doesn't retry
+    console.error('[Cashfree Webhook] Webhook error:', err?.message || err);
+    res.status(200).json({ status: 'ok' }); // always 200 so Cashfree doesn't retry endlessly
   }
 });
 
@@ -129,7 +155,7 @@ app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ── Cashfree: remaining routes (create-order, confirm-order) use JSON body ──
+// ── Cashfree: remaining routes (create-order, confirm-order, status) use JSON body ──
 app.use('/api/payments/cashfree', cashfreeRoutes);
 // Express 5 + path-to-regexp does not accept "*" as a path pattern here.
 // Use a regex to enable CORS preflight handling for all routes.
@@ -186,7 +212,48 @@ const toSlug = (value) => {
     .replace(/^-+|-+$/g, '');
 };
 
-const mapOrderForFrontend = (order) => {
+const CATEGORY_NUMBER_RE = /^\d{3}$/;
+const PRODUCT_NUMBER_RE = /^(\d{3})-(\d{2})$/;
+const VARIANT_NUMBER_RE = /^\d{2}$/;
+
+const validateCategoryNumber = (value) => {
+  const normalized = String(value ?? '').trim();
+  if (!CATEGORY_NUMBER_RE.test(normalized)) throw new Error('Category Number must be exactly 3 digits');
+  return normalized;
+};
+
+const validateProductNumber = (value, categoryNumber) => {
+  const normalized = String(value ?? '').trim();
+  const match = PRODUCT_NUMBER_RE.exec(normalized);
+  if (!match || match[1] !== categoryNumber || Number(match[2]) < 1 || Number(match[2]) > 99) {
+    throw new Error('Product Number must match CATEGORY_NUMBER-01 through CATEGORY_NUMBER-99');
+  }
+  return normalized;
+};
+
+const validateVariantNumbers = (variants) => {
+  const seen = new Set();
+  return variants.map((variant, index) => {
+    const number = String(variant.variantNumber || String(index + 1).padStart(2, '0')).trim();
+    if (!VARIANT_NUMBER_RE.test(number) || Number(number) < 1 || Number(number) > 99) {
+      throw new Error('Variant Number must be between 01 and 99');
+    }
+    if (seen.has(number)) throw new Error(`Duplicate Variant Number: ${number}`);
+    seen.add(number);
+    return number;
+  });
+};
+
+const serializeCategory = (category) => ({
+  id: category.id,
+  name: category.name,
+  slug: category.slug,
+  description: category.description,
+  image: category.image,
+  subcategories: (category.subcategories || []).map(({ id, name, slug, categoryId }) => ({ id, name, slug, categoryId })),
+});
+
+const mapOrderForFrontend = (order, isAdmin = false) => {
   if (!order) return order;
   const customer = order.customer || {};
   const items = (order.items || []).map((item) => {
@@ -199,11 +266,11 @@ const mapOrderForFrontend = (order) => {
         ? product.basePrice + (variant.additionalPrice || 0)
         : 0;
     const totalPrice = unitPrice * (item.quantity || 0);
-    const image = Array.isArray(product.images) ? product.images[0] : '';
-    return {
-      productId: variant.productId || product.id || '',
-      variantId: item.variantId || variant.id || '',
+    const image = (Array.isArray(variant.images) && variant.images[0]) || (Array.isArray(product.images) && product.images[0]) || '';
+    
+    const mappedItem = {
       productName: product.name || '',
+      productSlug: product.slug || '',
       color: variant.color,
       pattern: variant.pattern,
       quantity: item.quantity || 0,
@@ -213,40 +280,59 @@ const mapOrderForFrontend = (order) => {
       variant:
         variant.color && variant.pattern ? `${variant.color} / ${variant.pattern}` : variant.color || variant.pattern,
     };
-  });
-  const subtotal = items.reduce((sum, item) => sum + item.totalPrice, 0);
-  const totalAmount = typeof order.totalAmount === 'number' ? order.totalAmount : 0;
-  const shippingCharge = Math.max(0, totalAmount - subtotal);
 
-  return {
-    id: order.id,
+    if (isAdmin) {
+      mappedItem.productId = variant.productId || product.id || '';
+      mappedItem.variantId = item.variantId || variant.id || '';
+      mappedItem.productNumber = product.productNumber || '';
+      mappedItem.variantNumber = variant.variantNumber || '';
+    }
+
+    return mappedItem;
+  });
+
+  const calculatedSubtotal = items.reduce((sum, item) => sum + item.totalPrice, 0);
+  const subtotal = typeof order.subtotal === 'number' ? order.subtotal : calculatedSubtotal;
+  const totalAmount = typeof order.totalAmount === 'number' ? order.totalAmount : 0;
+  const shippingCharge = typeof order.deliveryCharge === 'number' ? order.deliveryCharge : Math.max(0, totalAmount - subtotal);
+
+  const mapped = {
     orderNumber: order.orderNumber,
-    customerName: customer.name || '',
-    customerPhone: customer.phone || '',
-    customerEmail: customer.email || '',
-    deliveryAddress: customer.address || '',
-    city: customer.city || '',
-    state: customer.state || '',
-    pincode: customer.pincode || '',
+    orderStatus: mapOrderStatus(order.status || order.orderStatus),
+    paymentStatus: mapPaymentStatus(order.paymentStatus),
+    paymentMethod: order.paymentMethod || '',
     items,
     subtotal,
     shippingCharge,
     totalAmount,
-    paymentMethod: order.paymentMethod || '',
-    paymentStatus: mapPaymentStatus(order.paymentStatus),
-    paymentScreenshot: order.paymentScreenshot,
-    upiTransactionId: order.upiTransactionId,
-    paidAt: toIsoString(order.paidAt),
-    orderStatus: mapOrderStatus(order.status || order.orderStatus),
-    trackingCarrier: order.trackingCarrier,
-    trackingNumber: order.trackingNumber,
-    trackingUrl: order.trackingUrl,
+    customerName: customer.name || '',
+    customerPhone: customer.phone || '',
+    whatsappNumber: order.whatsappNumber || customer.whatsappNumber || '',
+    deliveryAddress: order.deliveryAddress || customer.address || '',
+    city: order.city || customer.city || '',
+    state: order.state || customer.state || '',
+    pincode: order.pincode || customer.pincode || '',
+    trackingRequested: Boolean(order.trackingRequested),
+    trackingCarrier: order.trackingCarrier || null,
+    trackingNumber: order.trackingNumber || null,
+    trackingUrl: order.trackingUrl || null,
     shippedAt: toIsoString(order.shippedAt),
     deliveredAt: toIsoString(order.deliveredAt),
-    notes: order.notes,
     createdAt: toIsoString(order.createdAt),
     updatedAt: toIsoString(order.updatedAt),
   };
+
+  if (isAdmin) {
+    mapped.id = order.id;
+    mapped.customerId = order.customerId;
+    mapped.customerEmail = customer.email || '';
+    mapped.paymentScreenshot = order.paymentScreenshot;
+    mapped.upiTransactionId = order.upiTransactionId;
+    mapped.paidAt = toIsoString(order.paidAt);
+    mapped.notes = order.notes;
+  }
+
+  return mapped;
 };
 
 const emptySettings = {
@@ -319,24 +405,32 @@ const mapDeliverySettingsForFrontend = (settings) => {
   const updatedAt = toIsoString(settings?.updatedAt) || toIsoString(new Date());
   const regions = (settings?.regions || []).map((region) => {
     const regionName =
-      region.city && region.state
+      region.regionName ||
+      (region.city && region.state
         ? `${region.city}, ${region.state}`
-        : region.city || region.state || region.pincode || '';
+        : region.city || region.state || region.pincode || '');
     return {
       id: region.id,
       regionName,
-      pincodeStart: region.pincode,
-      pincodeEnd: region.pincode,
+      city: region.city || regionName,
+      state: region.state || '',
+      pincode: region.pincode || '',
+      pincodeStart: region.pincodeStart || region.pincode || '',
+      pincodeEnd: region.pincodeEnd || region.pincodeStart || region.pincode || '',
       isEnabled: region.isActive,
       deliveryCharge: region.shippingCharge,
-      estimatedDays: 3,
+      estimatedDays: 7,
       codAvailable: true,
       createdAt: updatedAt,
       updatedAt,
     };
   });
 
-  return { regions };
+  return {
+    freeShippingThreshold: settings?.freeShippingThreshold ?? 9999,
+    defaultShippingCharge: settings?.defaultShippingCharge ?? 100,
+    regions,
+  };
 };
 
 const parseRegionName = (regionName) => {
@@ -349,8 +443,8 @@ const parseRegionName = (regionName) => {
 
 const normalizeDeliveryInput = (body, existing) => {
   const base = {
-    freeShippingThreshold: existing?.freeShippingThreshold ?? 999,
-    defaultShippingCharge: existing?.defaultShippingCharge ?? 50,
+    freeShippingThreshold: Number(body?.freeShippingThreshold ?? existing?.freeShippingThreshold ?? 9999),
+    defaultShippingCharge: Number(body?.defaultShippingCharge ?? existing?.defaultShippingCharge ?? 100),
   };
 
   if (!body || typeof body !== 'object') {
@@ -360,15 +454,22 @@ const normalizeDeliveryInput = (body, existing) => {
   const regionsInput = Array.isArray(body.regions) ? body.regions : [];
   const regions = regionsInput
     .map((region) => {
-      const { city, state } = parseRegionName(region.regionName);
-      const pincode = String(region.pincodeStart || region.pincode || '').trim();
-      if (!pincode) return null;
+      const regionName = String(region.regionName || region.city || '').trim();
+      if (!regionName) return null;
+      const { city, state } = parseRegionName(regionName);
+      const pincode = String(region.pincode || region.pincodeStart || '').trim();
+      const pincodeStart = String(region.pincodeStart || pincode).trim() || null;
+      const pincodeEnd = String(region.pincodeEnd || pincodeStart || '').trim() || null;
+      const charge = Number(region.deliveryCharge ?? region.shippingCharge ?? base.defaultShippingCharge ?? 100);
       return {
-        pincode,
-        city: region.city || city || '',
-        state: region.state || state || '',
-        shippingCharge: Number(region.deliveryCharge ?? region.shippingCharge ?? base.defaultShippingCharge ?? 0),
-        isActive: region.isEnabled ?? region.isActive ?? true,
+        regionName,
+        pincode: pincode || null,
+        pincodeStart,
+        pincodeEnd,
+        city: region.city || city || regionName,
+        state: region.state || state || null,
+        shippingCharge: isNaN(charge) ? 100 : charge,
+        isActive: region.isEnabled !== undefined ? Boolean(region.isEnabled) : region.isActive !== undefined ? Boolean(region.isActive) : true,
       };
     })
     .filter(Boolean);
@@ -762,22 +863,23 @@ app.get('/api/health', (req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
 
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
+const {
+  authenticateFirebaseToken,
+  requireCustomer,
+  requireAdmin,
+} = require('./middleware/auth.middleware');
 
-  if (!token) {
-    return res.status(401).json({ error: 'Access token required' });
-  }
+// Admin authentication middleware (Firebase Token + PostgreSQL Admin Role)
+const authenticateAdmin = [authenticateFirebaseToken, requireAdmin];
+// Customer authentication middleware (Firebase Token + Customer Record Sync)
+const authenticateCustomer = [authenticateFirebaseToken, requireCustomer];
 
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid token' });
-    }
-    req.user = user;
-    next();
-  });
-};
+// Standard auth middleware for protected endpoints
+const authenticateToken = authenticateFirebaseToken;
+
+// Admin Media Routes (Cloudinary Image Upload & Management)
+const mediaRoutes = require('./routes/media.routes');
+app.use('/api/admin/media', authenticateAdmin, mediaRoutes);
 
 if (PUBLIC_DOCS) {
   console.log('[DOCS] PUBLIC_DOCS=1: exposing /api/docs and /api/openapi.json without auth (local only).');
@@ -796,13 +898,11 @@ app.get('/api/categories', async (req, res) => {
   try {
     console.log('[API] Fetching categories from database...');
     const categories = await prisma.category.findMany({
-      include: {
-        products: true,
-        subcategories: { orderBy: { name: 'asc' } },
-      }
+      include: { subcategories: { orderBy: { name: 'asc' } } },
+      orderBy: { categoryNumber: 'asc' },
     });
     console.log('[API] Categories found:', categories.length);
-    res.json({ categories, products: categories.flatMap(c => c.products) });
+    res.json({ categories: categories.map(serializeCategory) });
   } catch (error) {
     console.error('[API] Error fetching categories:', error);
     res.status(500).json({ error: 'Failed to fetch categories', details: error.message });
@@ -822,7 +922,12 @@ app.get('/api/subcategories', async (req, res) => {
       orderBy: { name: 'asc' },
     });
 
-    res.json({ subcategories });
+    res.json({
+      subcategories: subcategories.map(({ category, ...subcategory }) => ({
+        ...subcategory,
+        category: category ? serializeCategory(category) : undefined,
+      })),
+    });
   } catch (error) {
     console.error('[API] Error fetching subcategories:', error);
     res.status(500).json({ error: 'Failed to fetch subcategories', details: error.message });
@@ -836,13 +941,14 @@ app.get('/api/subcategories/:id', async (req, res) => {
       include: { category: true },
     });
     if (!subcategory) return res.status(404).json({ error: 'Subcategory not found' });
-    res.json(subcategory);
+    const { category, ...subcategoryData } = subcategory;
+    res.json({ ...subcategoryData, category: category ? serializeCategory(category) : undefined });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch subcategory' });
   }
 });
 
-app.post('/api/subcategories', authenticateToken, async (req, res) => {
+app.post('/api/subcategories', authenticateAdmin, async (req, res) => {
   try {
     const { name, slug, categoryId } = req.body || {};
     if (!name || !categoryId) {
@@ -862,7 +968,7 @@ app.post('/api/subcategories', authenticateToken, async (req, res) => {
   }
 });
 
-app.put('/api/subcategories/:id', authenticateToken, async (req, res) => {
+app.put('/api/subcategories/:id', authenticateAdmin, async (req, res) => {
   try {
     const { name, slug, categoryId } = req.body || {};
     const data = {};
@@ -880,7 +986,7 @@ app.put('/api/subcategories/:id', authenticateToken, async (req, res) => {
   }
 });
 
-app.delete('/api/subcategories/:id', authenticateToken, async (req, res) => {
+app.delete('/api/subcategories/:id', authenticateAdmin, async (req, res) => {
   try {
     const subcategoryId = String(req.params.id);
 
@@ -908,30 +1014,34 @@ app.delete('/api/subcategories/:id', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/categories', authenticateToken, async (req, res) => {
+app.post('/api/categories', authenticateAdmin, async (req, res) => {
   try {
+    const { name, slug, description, image, categoryNumber } = req.body || {};
     const category = await prisma.category.create({
-      data: req.body
+      data: { name, slug, description, image, categoryNumber: validateCategoryNumber(categoryNumber) }
     });
     res.json(category);
   } catch (error) {
-    res.status(500).json({ error: 'Failed to create category' });
+    const status = error?.code === 'P2002' ? 409 : /Category Number/.test(error?.message || '') ? 400 : 500;
+    res.status(status).json({ error: status === 409 ? 'Category Number or slug already exists' : error?.message || 'Failed to create category' });
   }
 });
 
-app.put('/api/categories/:id', authenticateToken, async (req, res) => {
+app.put('/api/categories/:id', authenticateAdmin, async (req, res) => {
   try {
+    const { name, slug, description, image, categoryNumber } = req.body || {};
     const category = await prisma.category.update({
       where: { id: req.params.id },
-      data: req.body
+      data: { name, slug, description, image, categoryNumber: validateCategoryNumber(categoryNumber) }
     });
     res.json(category);
   } catch (error) {
-    res.status(500).json({ error: 'Failed to update category' });
+    const status = error?.code === 'P2002' ? 409 : /Category Number/.test(error?.message || '') ? 400 : 500;
+    res.status(status).json({ error: status === 409 ? 'Category Number or slug already exists' : error?.message || 'Failed to update category' });
   }
 });
 
-app.delete('/api/categories/:id', authenticateToken, async (req, res) => {
+app.delete('/api/categories/:id', authenticateAdmin, async (req, res) => {
   try {
     const categoryId = String(req.params.id);
 
@@ -986,6 +1096,58 @@ app.get('/api/products', async (req, res) => {
   }
 });
 
+// Admin-only: Returns full product data including productNumber (NOT exposed to customers)
+app.get('/api/admin/products', authenticateAdmin, async (req, res) => {
+  try {
+    const { categoryId, categorySlug, subcategoryId, subcategorySlug, productNumber, q } = req.query;
+    const where = {};
+    if (categoryId) where.categoryId = String(categoryId);
+    if (categorySlug) where.category = { slug: String(categorySlug) };
+    if (subcategoryId) where.subcategoryId = String(subcategoryId);
+    if (subcategorySlug) where.subcategory = { slug: String(subcategorySlug) };
+    if (productNumber) where.productNumber = String(productNumber);
+    if (q) {
+      const query = String(q);
+      where.OR = [
+        { id: query },
+        { productNumber: { contains: query, mode: 'insensitive' } },
+        { slug: { contains: query, mode: 'insensitive' } },
+        { name: { contains: query, mode: 'insensitive' } },
+      ];
+    }
+
+    const products = await prisma.product.findMany({
+      where,
+      include: {
+        category: true,
+        subcategory: true,
+        variants: true
+      },
+      orderBy: { productNumber: 'asc' }
+    });
+
+    // Admin sees full product data INCLUDING productNumber
+    const adminProducts = products.map((product) => {
+      const { category, subcategory, ...rest } = product;
+      return {
+        ...rest,
+        category: category?.slug || rest.categoryId,
+        categoryDetails: category || null,
+        subcategory: subcategory?.slug || rest.subcategoryId || null,
+        subcategoryDetails: subcategory || null,
+        // productNumber is KEPT for admin — not stripped
+      };
+    });
+
+    res.json({ products: adminProducts });
+  } catch (error) {
+    console.error('Error fetching admin products:', error);
+    res.status(500).json({ error: 'Failed to fetch products', details: error.message });
+  }
+});
+
+
+
 app.get('/api/products/slug/:slug', async (req, res) => {
   try {
     const product = await prisma.product.findFirst({
@@ -1024,28 +1186,46 @@ app.get('/api/products/:id', async (req, res) => {
   }
 });
 
-app.post('/api/products', authenticateToken, async (req, res) => {
+app.post('/api/products', authenticateAdmin, async (req, res) => {
   try {
-    const { variants, category, categoryId, subcategory, subcategoryId, ...productData } = req.body;
+    const { variants, category, categoryId, subcategory, subcategoryId, productNumber: _ignoredProductNumber, ...productData } = req.body;
+    const resolvedCategoryId = categoryId || category;
+    const selectedCategory = await prisma.category.findUnique({ where: { id: resolvedCategoryId } });
+    if (!selectedCategory) return res.status(400).json({ error: 'Invalid category' });
+    const categoryNumber = validateCategoryNumber(selectedCategory.categoryNumber);
+    const existingNumbers = await prisma.product.findMany({
+      where: { categoryId: resolvedCategoryId, productNumber: { not: null } },
+      select: { productNumber: true },
+    });
+    const used = new Set(existingNumbers.map((p) => p.productNumber));
+    let sequence = 1;
+    while (used.has(`${categoryNumber}-${String(sequence).padStart(2, '0')}`) && sequence <= 99) sequence += 1;
+    if (sequence > 99) return res.status(409).json({ error: 'No Product Number available for this category' });
+    productData.productNumber = `${categoryNumber}-${String(sequence).padStart(2, '0')}`;
 
-    // Basic validation: each variant must have >= 1 image URL
-    if (Array.isArray(variants)) {
-      for (const v of variants) {
-        if (!v?.sku) {
-          return res.status(400).json({ error: 'Each variant must have a sku' });
-        }
-        if (!Array.isArray(v?.images) || v.images.length < 1) {
-          return res.status(400).json({ error: `Variant ${v.sku} must have at least 1 image` });
-        }
-      }
-    }
+    const variantNumbers = validateVariantNumbers(variants || []);
+    const processedVariants = (variants || []).map((v, idx) => {
+      const vNum = variantNumbers[idx];
+      const sku = v.sku || `${productData.productNumber}-V${vNum}-${Date.now().toString().slice(-4)}${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
+      return {
+        color: v.color || 'Standard',
+        pattern: v.pattern || 'Classic',
+        stock: Number(v.stock) || 0,
+        additionalPrice: Number(v.additionalPrice) || 0,
+        variantNumber: vNum,
+        sku,
+        images: Array.isArray(v.images) && v.images.length > 0 ? v.images : (Array.isArray(productData.images) && productData.images.length > 0 ? [productData.images[0]] : []),
+        isAvailable: v.isAvailable !== false,
+      };
+    });
+
     const product = await prisma.product.create({
       data: {
         ...productData,
-        categoryId: categoryId || category,
+        categoryId: resolvedCategoryId,
         ...(subcategoryId || subcategory ? { subcategoryId: subcategoryId || subcategory } : {}),
         variants: {
-          create: variants || []
+          create: processedVariants
         }
       },
       include: {
@@ -1056,7 +1236,6 @@ app.post('/api/products', authenticateToken, async (req, res) => {
     });
     res.json(serializeProduct(product));
   } catch (error) {
-    // Give actionable errors to the frontend (ex: unique slug/sku collisions)
     console.error('Error creating product:', {
       message: error?.message,
       code: error?.code,
@@ -1064,15 +1243,13 @@ app.post('/api/products', authenticateToken, async (req, res) => {
     });
 
     if (error instanceof Prisma.PrismaClientKnownRequestError) {
-      // P2002 = Unique constraint failed
       if (error.code === 'P2002') {
         return res.status(409).json({
           error: 'Unique constraint failed',
           fields: error?.meta?.target || null,
-          details: 'A product slug or variant SKU already exists. Use a different value.'
+          details: 'A product slug or variant identifier already exists. Use a different value.'
         });
       }
-      // P2003 = Foreign key constraint failed
       if (error.code === 'P2003') {
         return res.status(400).json({
           error: 'Invalid reference',
@@ -1081,40 +1258,62 @@ app.post('/api/products', authenticateToken, async (req, res) => {
       }
     }
 
-    res.status(500).json({ error: 'Failed to create product', details: error?.message });
+    const status = error?.code === 'P2002' || /Product Number|Variant Number|Duplicate Variant/.test(error?.message || '') ? 400 : 500;
+    res.status(status).json({ error: error?.message || 'Failed to create product' });
   }
 });
 
-app.put('/api/products/:id', authenticateToken, async (req, res) => {
+app.put('/api/products/:id', authenticateAdmin, async (req, res) => {
   try {
     const { variants, category, categoryId, subcategory, subcategoryId, ...productData } = req.body;
+    const productId = req.params.id;
+    const existingProduct = await prisma.product.findUnique({ where: { id: productId } });
+    if (!existingProduct) return res.status(404).json({ error: 'Product not found' });
+    const resolvedCategoryId = categoryId || category || existingProduct.categoryId;
+    const selectedCategory = await prisma.category.findUnique({ where: { id: resolvedCategoryId } });
+    if (!selectedCategory) return res.status(400).json({ error: 'Invalid category' });
+    const categoryNumber = validateCategoryNumber(selectedCategory.categoryNumber);
+    if (productData.productNumber != null) productData.productNumber = validateProductNumber(productData.productNumber, categoryNumber);
+    if (resolvedCategoryId !== existingProduct.categoryId && productData.productNumber == null) {
+      return res.status(400).json({ error: 'Product Number must be supplied when changing category' });
+    }
 
-    const productId = req.params.id
-
-    // If variants are being updated, we preserve variant IDs by upserting by SKU.
-    // Deletions are treated as SOFT delete: set isAvailable=false and stock=0.
     if (Array.isArray(variants)) {
-      for (const v of variants) {
-        if (!v?.sku) {
-          return res.status(400).json({ error: 'Each variant must have a sku' });
-        }
-        if (!Array.isArray(v?.images) || v.images.length < 1) {
-          return res.status(400).json({ error: `Variant ${v.sku} must have at least 1 image` });
-        }
-      }
+      const existingVariants = await prisma.variant.findMany({
+        where: { productId }
+      });
+      const existingById = new Map(existingVariants.map(v => [v.id, v]));
 
-      const incomingSkus = variants.map((v) => v.sku)
+      const variantNumbers = validateVariantNumbers(variants);
+      const processedVariants = variants.map((v, idx) => {
+        const existing = v.id ? existingById.get(v.id) : null;
+        const vNum = variantNumbers[idx] || existing?.variantNumber || String(idx + 1).padStart(2, '0');
+        const sku = v.sku || existing?.sku || `${productData.productNumber || 'P'}-V${vNum}-${Date.now().toString().slice(-4)}${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
+        return {
+          id: v.id || undefined,
+          color: v.color || 'Standard',
+          pattern: v.pattern || 'Classic',
+          stock: Number(v.stock) || 0,
+          additionalPrice: Number(v.additionalPrice) || 0,
+          variantNumber: vNum,
+          sku,
+          images: Array.isArray(v.images) && v.images.length > 0 ? v.images : (existing?.images || []),
+          isAvailable: v.isAvailable !== false,
+        };
+      });
+
+      const incomingSkus = processedVariants.map((v) => v.sku);
 
       // Prevent SKU collisions across products (sku is globally unique in schema).
       const existingBySku = await prisma.variant.findMany({
         where: { sku: { in: incomingSkus } },
         select: { sku: true, productId: true },
-      })
-      const foreign = existingBySku.find((v) => v.productId !== productId)
+      });
+      const foreign = existingBySku.find((v) => v.productId !== productId);
       if (foreign) {
         return res
           .status(400)
-          .json({ error: `SKU ${foreign.sku} already exists on another product` })
+          .json({ error: `Identifier collision across products` });
       }
 
       const [updatedProduct] = await prisma.$transaction([
@@ -1122,18 +1321,19 @@ app.put('/api/products/:id', authenticateToken, async (req, res) => {
           where: { id: productId },
           data: {
             ...productData,
-            ...(categoryId || category ? { categoryId: categoryId || category } : {}),
+            categoryId: resolvedCategoryId,
             ...(subcategoryId !== undefined || subcategory !== undefined
               ? { subcategoryId: subcategoryId ?? subcategory ?? null }
               : {}),
             variants: {
-              upsert: variants.map((v) => ({
+              upsert: processedVariants.map((v) => ({
                 where: { sku: v.sku },
                 update: {
                   color: v.color,
                   pattern: v.pattern,
                   stock: v.stock,
                   additionalPrice: v.additionalPrice,
+                  variantNumber: v.variantNumber,
                   images: v.images,
                   isAvailable: v.isAvailable,
                 },
@@ -1142,6 +1342,7 @@ app.put('/api/products/:id', authenticateToken, async (req, res) => {
                   pattern: v.pattern,
                   stock: v.stock,
                   additionalPrice: v.additionalPrice,
+                  variantNumber: v.variantNumber,
                   sku: v.sku,
                   images: v.images,
                   isAvailable: v.isAvailable ?? true,
@@ -1165,9 +1366,9 @@ app.put('/api/products/:id', authenticateToken, async (req, res) => {
             stock: 0,
           },
         }),
-      ])
+      ]);
 
-      return res.json(serializeProduct(updatedProduct))
+      return res.json(serializeProduct(updatedProduct));
     }
 
     // If variants are not part of this request, only update product fields.
@@ -1175,7 +1376,7 @@ app.put('/api/products/:id', authenticateToken, async (req, res) => {
       where: { id: productId },
       data: {
         ...productData,
-        ...(categoryId || category ? { categoryId: categoryId || category } : {}),
+        categoryId: resolvedCategoryId,
         ...(subcategoryId !== undefined || subcategory !== undefined
           ? { subcategoryId: subcategoryId ?? subcategory ?? null }
           : {}),
@@ -1188,11 +1389,12 @@ app.put('/api/products/:id', authenticateToken, async (req, res) => {
     })
     res.json(serializeProduct(product))
   } catch (error) {
-    res.status(500).json({ error: 'Failed to update product' });
+    const status = error?.code === 'P2002' || /Product Number|Variant Number|Duplicate Variant/.test(error?.message || '') ? 400 : 500;
+    res.status(status).json({ error: error?.message || 'Failed to update product' });
   }
 });
 
-app.delete('/api/products/:id', authenticateToken, async (req, res) => {
+app.delete('/api/products/:id', authenticateAdmin, async (req, res) => {
   try {
     await prisma.product.delete({
       where: { id: req.params.id }
@@ -1203,7 +1405,7 @@ app.delete('/api/products/:id', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/api/orders', authenticateToken, async (req, res) => {
+app.get('/api/orders', authenticateAdmin, async (req, res) => {
   try {
     const orders = await prisma.order.findMany({
       include: {
@@ -1220,7 +1422,7 @@ app.get('/api/orders', authenticateToken, async (req, res) => {
       },
       orderBy: { createdAt: 'desc' }
     });
-    const mappedOrders = orders.map((order) => mapOrderForFrontend(order));
+    const mappedOrders = orders.map((order) => mapOrderForFrontend(order, true));
     res.json({ orders: mappedOrders });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch orders' });
@@ -1345,8 +1547,8 @@ app.get('/api/orders/by-phone', trackingLimiter, async (req, res) => {
   }
 });
 
-// Get single order by ID (requires auth)
-app.get('/api/orders/:id', authenticateToken, async (req, res) => {
+// Get single order by ID (Admin only)
+app.get('/api/orders/:id', authenticateAdmin, async (req, res) => {
   try {
     const order = await prisma.order.findUnique({
       where: { id: req.params.id },
@@ -1368,7 +1570,7 @@ app.get('/api/orders/:id', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Order not found' });
     }
 
-    res.json(mapOrderForFrontend(order));
+    res.json(mapOrderForFrontend(order, true));
   } catch (error) {
     console.error('Failed to fetch order:', error);
     res.status(500).json({ error: 'Failed to fetch order' });
@@ -1379,93 +1581,87 @@ app.post('/api/orders', orderLimiter, async (req, res) => {
   try {
     const { customer, items, ...orderData } = req.body;
 
-    // Validate required fields
     if (!customer || !items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: 'Customer and items are required' });
     }
 
-    // Validate customer fields
     if (!customer.name || !customer.email || !customer.phone) {
       return res.status(400).json({ error: 'Customer name, email, and phone are required' });
     }
 
-    // Validate phone number (10 digits)
-    if (!/^\d{10}$/.test(customer.phone)) {
+    const cleanPhone = String(customer.phone).replace(/\D/g, '').slice(-10);
+    if (cleanPhone.length !== 10) {
       return res.status(400).json({ error: 'Phone number must be exactly 10 digits' });
     }
 
-    // Validate email format
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(customer.email)) {
-      return res.status(400).json({ error: 'Invalid email format' });
-    }
-
-    // Validate items
     for (const item of items) {
       if (!item.variantId || !item.quantity || item.quantity < 1) {
         return res.status(400).json({ error: 'Each item must have variantId and quantity >= 1' });
       }
     }
 
-    // Validate stock / availability
     const variantIds = [...new Set(items.map((i) => i.variantId))];
     const variants = await prisma.variant.findMany({
       where: { id: { in: variantIds } },
-      select: { id: true, stock: true, isAvailable: true },
+      include: { product: true },
     });
     const variantById = new Map(variants.map((v) => [v.id, v]));
+    let subtotal = 0;
+    const validatedItems = [];
+
     for (const item of items) {
       const variant = variantById.get(item.variantId);
-      if (!variant) {
-        return res.status(409).json({ error: 'Variant not found', variantId: item.variantId });
+      if (!variant || !variant.isAvailable || variant.stock < item.quantity) {
+        return res.status(409).json({ error: 'Variant not available or insufficient stock' });
       }
-      if (!variant.isAvailable || variant.stock <= 0) {
-        return res.status(409).json({ error: 'Variant is not available', variantId: item.variantId });
-      }
-      if (item.quantity > variant.stock) {
-        return res.status(409).json({
-          error: 'Insufficient stock',
-          variantId: item.variantId,
-          available: variant.stock,
-          requested: item.quantity,
-        });
-      }
+      const unitPrice = (variant.product?.basePrice || 0) + (variant.additionalPrice || 0);
+      subtotal += unitPrice * item.quantity;
+      validatedItems.push({
+        variantId: variant.id,
+        quantity: item.quantity,
+        price: unitPrice,
+      });
     }
 
+    const deliveryCharge = Number(orderData.deliveryCharge) >= 0 ? Number(orderData.deliveryCharge) : 100;
+    const totalAmount = subtotal + deliveryCharge;
     const orderNumber = `ORD-${Date.now()}`;
-
-    // Convert enum values to uppercase
-    const normalizedOrderData = {
-      ...orderData,
-      status: orderData.status?.toUpperCase() || 'PENDING',
-      paymentStatus: orderData.paymentStatus?.toUpperCase() || 'PENDING',
-    };
 
     const order = await prisma.order.create({
       data: {
-        ...normalizedOrderData,
         orderNumber,
+        status: orderData.status?.toUpperCase() || 'PENDING',
+        paymentStatus: orderData.paymentStatus?.toUpperCase() || 'PENDING',
+        paymentMethod: orderData.paymentMethod || 'PENDING',
+        totalAmount,
+        subtotal,
+        deliveryCharge,
+        deliveryAddress: customer.address || '',
+        city: customer.city || '',
+        state: customer.state || '',
+        pincode: customer.pincode || '',
+        whatsappNumber: customer.whatsappNumber ? String(customer.whatsappNumber).replace(/\D/g, '').slice(-10) : null,
+        trackingRequested: Boolean(orderData.trackingRequested),
         customer: {
           connectOrCreate: {
-            where: { phone: customer.phone },
+            where: { phone: cleanPhone },
             create: {
               name: customer.name,
               email: customer.email,
-              phone: customer.phone,
+              phone: cleanPhone,
+              whatsappNumber: customer.whatsappNumber ? String(customer.whatsappNumber).replace(/\D/g, '').slice(-10) : null,
               address: customer.address || '',
               city: customer.city || '',
               state: customer.state || '',
-              pincode: customer.pincode || ''
+              pincode: customer.pincode || '',
             }
           }
         },
         items: {
-          create: items.map(item => ({
+          create: validatedItems.map(item => ({
             quantity: item.quantity,
             price: item.price,
-            variant: {
-              connect: { id: item.variantId }
-            }
+            variant: { connect: { id: item.variantId } }
           }))
         }
       },
@@ -1474,27 +1670,24 @@ app.post('/api/orders', orderLimiter, async (req, res) => {
         items: {
           include: {
             variant: {
-              include: {
-                product: true
-              }
+              include: { product: true }
             }
           }
         }
       }
     });
 
-    res.json(mapOrderForFrontend(order));
+    res.json(mapOrderForFrontend(order, false));
   } catch (error) {
     console.error('Order creation error:', error);
     res.status(500).json({ error: 'Failed to create order', details: error.message });
   }
 });
 
-app.put('/api/orders/:id', authenticateToken, async (req, res) => {
+app.put('/api/orders/:id', authenticateAdmin, async (req, res) => {
   try {
     const updateData = { ...req.body };
     
-    // Map frontend field names to database field names
     if (updateData.orderStatus) {
       updateData.status = updateData.orderStatus.toUpperCase();
       delete updateData.orderStatus;
@@ -1506,6 +1699,13 @@ app.put('/api/orders/:id', authenticateToken, async (req, res) => {
       updateData.paymentStatus = updateData.paymentStatus.toUpperCase();
     }
 
+    if (updateData.status === 'SHIPPED' && !updateData.shippedAt) {
+      updateData.shippedAt = new Date();
+    }
+    if (updateData.status === 'DELIVERED' && !updateData.deliveredAt) {
+      updateData.deliveredAt = new Date();
+    }
+
     const order = await prisma.order.update({
       where: { id: req.params.id },
       data: updateData,
@@ -1514,15 +1714,13 @@ app.put('/api/orders/:id', authenticateToken, async (req, res) => {
         items: {
           include: {
             variant: {
-              include: {
-                product: true
-              }
+              include: { product: true }
             }
           }
         }
       }
     });
-    res.json(mapOrderForFrontend(order));
+    res.json(mapOrderForFrontend(order, true));
   } catch (error) {
     console.error('Failed to update order:', error);
     res.status(500).json({ error: 'Failed to update order', details: error.message });
@@ -1614,10 +1812,10 @@ app.put('/api/settings', authenticateToken, async (req, res) => {
   }
 });
 
-app.get('/api/delivery', authenticateToken, async (req, res) => {
+app.get('/api/delivery', async (req, res) => {
   try {
     const settings = await prisma.deliverySettings.findFirst({
-      include: { regions: true }
+      include: { regions: { orderBy: { regionName: 'asc' } } }
     });
     res.json(mapDeliverySettingsForFrontend(settings));
   } catch (error) {
@@ -1625,7 +1823,7 @@ app.get('/api/delivery', authenticateToken, async (req, res) => {
   }
 });
 
-app.put('/api/delivery', authenticateToken, async (req, res) => {
+app.put('/api/delivery', authenticateAdmin, async (req, res) => {
   try {
     const existing = await prisma.deliverySettings.findFirst();
     let settings;
@@ -1663,79 +1861,477 @@ app.put('/api/delivery', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+// ── Customer Auth Endpoints (Firebase Authenticated) ──────────────────────
+app.post('/api/auth/sync-customer', authenticateCustomer, async (req, res) => {
+  res.json({
+    success: true,
+    customer: req.customer,
+  });
+});
+
+app.get('/api/auth/customer/me', authenticateCustomer, async (req, res) => {
   try {
-    const { email, password } = req.body;
-    if (AUTH_DEBUG) console.log('[AUTH] Login attempt for:', email);
-    
-    const user = await prisma.adminUser.findUnique({
-      where: { email }
+    const customer = await prisma.customer.findUnique({
+      where: { id: req.customer.id },
+      include: {
+        orders: {
+          orderBy: { createdAt: 'desc' },
+          include: {
+            items: {
+              include: {
+                variant: {
+                  include: {
+                    product: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
     });
-    
-    if (AUTH_DEBUG) {
-      console.log('[AUTH] User lookup result:', user ? { id: user.id, isActive: user.isActive } : null);
+
+    if (!customer) {
+      return res.status(404).json({ error: 'Customer not found' });
     }
 
-    if (!user || !user.isActive) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    
-    let isValidPassword = false;
-    try {
-      isValidPassword = await bcrypt.compare(password, user.passwordHash);
-    } catch (err) {
-      console.error('[AUTH] bcrypt.compare failed:', err);
-      return res.status(500).json({ error: 'Login failed' });
-    }
-    
-    if (!isValidPassword) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    
-    await prisma.adminUser.update({
-      where: { id: user.id },
-      data: { lastLogin: new Date() }
-    });
-    
-    const token = jwt.sign(
-      { userId: user.id, email: user.email, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-    
-    res.json({
-      token,
-      user: mapAdminUserForFrontend(user)
-    });
-  } catch (error) {
-    res.status(500).json({ error: 'Login failed' });
+    res.json({ customer });
+  } catch (err) {
+    console.error('[API] /api/auth/customer/me error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch customer profile' });
   }
 });
 
-app.get('/api/auth/me', authenticateToken, async (req, res) => {
+// Update Customer Profile (Firebase Authenticated)
+app.put('/api/auth/customer/me', authenticateCustomer, async (req, res) => {
   try {
-    const user = await prisma.adminUser.findUnique({
-      where: { id: req.user.userId },
-      select: {
-        id: true,
-        username: true,
-        email: true,
-        role: true,
-        isActive: true,
-        lastLogin: true,
-        createdAt: true,
-        updatedAt: true
+    const { name, phone, whatsappNumber, address, city, state, pincode } = req.body;
+    const updated = await prisma.customer.update({
+      where: { id: req.customer.id },
+      data: {
+        ...(name && { name: String(name).trim() }),
+        ...(phone !== undefined && { phone: phone ? String(phone).trim() : null }),
+        ...(whatsappNumber !== undefined && { whatsappNumber: whatsappNumber ? String(whatsappNumber).trim() : null }),
+        ...(address !== undefined && { address: address ? String(address).trim() : null }),
+        ...(city !== undefined && { city: city ? String(city).trim() : null }),
+        ...(state !== undefined && { state: state ? String(state).trim() : null }),
+        ...(pincode !== undefined && { pincode: pincode ? String(pincode).trim() : null }),
+      },
+    });
+    res.json({ success: true, customer: updated });
+  } catch (err) {
+    console.error('[API] PUT /api/auth/customer/me error:', err.message);
+    res.status(500).json({ error: 'Failed to update customer profile' });
+  }
+});
+
+// Authenticated Customer Orders (Strict ownership enforcement)
+app.get('/api/customer/orders', authenticateCustomer, async (req, res) => {
+  try {
+    const orders = await prisma.order.findMany({
+      where: { customerId: req.customer.id },
+      orderBy: { createdAt: 'desc' },
+      include: {
+        items: {
+          include: {
+            variant: {
+              include: {
+                product: true,
+              },
+            },
+          },
+        },
+      },
+    });
+    res.json({ orders: orders.map((o) => mapOrderForFrontend(o, false)) });
+  } catch (err) {
+    console.error('[API] /api/customer/orders error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch customer orders' });
+  }
+});
+
+app.get('/api/customer/orders/:id', authenticateCustomer, async (req, res) => {
+  try {
+    const lookup = req.params.id;
+    const order = await prisma.order.findFirst({
+      where: {
+        customerId: req.customer.id,
+        OR: [
+          { id: lookup },
+          { orderNumber: lookup }
+        ],
+      },
+      include: {
+        customer: true,
+        items: {
+          include: {
+            variant: {
+              include: {
+                product: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found or unauthorized' });
+    }
+
+    res.json({ order: mapOrderForFrontend(order, false) });
+  } catch (err) {
+    console.error('[API] /api/customer/orders/:id error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch order' });
+  }
+});
+
+// Create/Prepare Customer Order (Proceed to Pay flow - Payment Gateway Not Called)
+app.post('/api/customer/orders', authenticateCustomer, orderLimiter, async (req, res) => {
+  try {
+    const {
+      name,
+      phone,
+      whatsappNumber,
+      address,
+      city,
+      state,
+      pincode,
+      addressConfirmed,
+      deliveryRegionId,
+      deliveryRegionName,
+      trackingRequested,
+      items: cartItems,
+    } = req.body;
+
+    // 1. Validate cart
+    if (!cartItems || !Array.isArray(cartItems) || cartItems.length === 0) {
+      return res.status(400).json({ error: 'Shopping bag cannot be empty' });
+    }
+
+    // 2. Validate customer contact details
+    const customerName = String(name || req.customer.name || '').trim();
+    const rawPhone = String(phone || req.customer.phone || '').trim();
+    const cleanPhone = rawPhone.replace(/\D/g, '').slice(-10);
+    const rawWhatsapp = String(whatsappNumber || req.customer.whatsappNumber || rawPhone).trim();
+    const cleanWhatsapp = rawWhatsapp.replace(/\D/g, '').slice(-10);
+
+    if (!customerName) {
+      return res.status(400).json({ error: 'Customer name is required' });
+    }
+    if (cleanPhone.length !== 10) {
+      return res.status(400).json({ error: 'A valid 10-digit mobile number is required' });
+    }
+    if (cleanWhatsapp.length !== 10) {
+      return res.status(400).json({ error: 'A valid 10-digit WhatsApp number is required' });
+    }
+
+    // 3. Validate delivery address
+    const cleanAddress = String(address || '').trim();
+    const cleanCity = String(city || '').trim();
+    const cleanState = String(state || '').trim();
+    const cleanPincode = String(pincode || '').trim();
+
+    if (!cleanAddress || !cleanCity || !cleanState || !cleanPincode) {
+      return res.status(400).json({ error: 'Please provide full address, city, state, and pincode' });
+    }
+
+    // 4. Validate explicit address confirmation
+    if (addressConfirmed !== true) {
+      return res.status(400).json({ error: 'Please confirm that the delivery address is correct before proceeding' });
+    }
+
+    // 5. Validate delivery region & determine charge from DB
+    const searchRegion = String(deliveryRegionName || cleanCity).trim().toLowerCase();
+    const deliverySettings = await prisma.deliverySettings.findFirst({
+      include: { regions: true }
+    });
+
+    const activeRegions = (deliverySettings?.regions || []).filter((r) => r.isActive);
+    let matchedRegion = null;
+
+    if (deliveryRegionId) {
+      matchedRegion = activeRegions.find((r) => r.id === deliveryRegionId);
+    }
+    if (!matchedRegion) {
+      matchedRegion = activeRegions.find(
+        (r) =>
+          (r.regionName && r.regionName.toLowerCase() === searchRegion) ||
+          (r.city && r.city.toLowerCase() === searchRegion) ||
+          (cleanPincode && ((r.pincode && r.pincode === cleanPincode) || (Number(cleanPincode) >= Number(r.pincodeStart || r.pincode || 0) && Number(cleanPincode) <= Number(r.pincodeEnd || r.pincodeStart || r.pincode || 0))))
+      );
+    }
+
+    if (!matchedRegion) {
+      return res.status(400).json({
+        error: `Delivery is currently unavailable for ${cleanCity || 'this location'}. Please choose a supported delivery region.`,
+        deliveryUnavailable: true,
+      });
+    }
+
+    const resolvedShippingCharge = Number(matchedRegion.shippingCharge);
+
+    // 6. Validate items & recalculate prices from DB
+    const variantIds = [...new Set(cartItems.map((i) => i.variantId).filter(Boolean))];
+    const variants = await prisma.variant.findMany({
+      where: { id: { in: variantIds } },
+      include: { product: true }
+    });
+    const variantById = new Map(variants.map((v) => [v.id, v]));
+
+    const stockErrors = [];
+    let serverSubtotal = 0;
+    const validatedItems = [];
+
+    for (const item of cartItems) {
+      const variant = variantById.get(item.variantId);
+      const qty = parseInt(item.quantity, 10) || 0;
+
+      if (!variant) {
+        stockErrors.push({ productName: item.productName || 'Item', reason: 'Product variant not found' });
+        continue;
+      }
+      if (!variant.isAvailable || variant.stock <= 0) {
+        stockErrors.push({ productName: variant.product?.name || 'Item', reason: 'Out of stock' });
+        continue;
+      }
+      if (qty <= 0) {
+        return res.status(400).json({ error: 'Item quantity must be greater than 0' });
+      }
+      if (qty > variant.stock) {
+        stockErrors.push({
+          productName: variant.product?.name || 'Item',
+          reason: `Only ${variant.stock} available in stock`,
+          available: variant.stock,
+          requested: qty,
+        });
+        continue;
+      }
+
+      const unitPrice = (variant.product?.basePrice || 0) + (variant.additionalPrice || 0);
+      serverSubtotal += unitPrice * qty;
+
+      validatedItems.push({
+        variantId: variant.id,
+        quantity: qty,
+        price: unitPrice,
+      });
+    }
+
+    if (stockErrors.length > 0) {
+      return res.status(409).json({
+        error: 'Some items in your shopping bag are no longer available in the requested quantity.',
+        stockErrors,
+      });
+    }
+
+    const finalTotal = serverSubtotal + resolvedShippingCharge;
+    const orderNumber = `ORD-${Date.now()}`;
+
+    // 7. Update customer profile with newest address & contact
+    await prisma.customer.update({
+      where: { id: req.customer.id },
+      data: {
+        name: customerName,
+        phone: cleanPhone,
+        whatsappNumber: cleanWhatsapp,
+        address: cleanAddress,
+        city: cleanCity,
+        state: cleanState,
+        pincode: cleanPincode,
+        deliveryRegionId: matchedRegion.id,
       }
     });
-    
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
+
+    // 8. Create Order in DB safely
+    const order = await prisma.order.create({
+      data: {
+        orderNumber,
+        status: 'PENDING',
+        paymentStatus: 'PENDING',
+        paymentMethod: 'PENDING',
+        totalAmount: finalTotal,
+        subtotal: serverSubtotal,
+        deliveryCharge: resolvedShippingCharge,
+        deliveryAddress: cleanAddress,
+        city: cleanCity,
+        state: cleanState,
+        pincode: cleanPincode,
+        whatsappNumber: cleanWhatsapp,
+        trackingRequested: Boolean(trackingRequested),
+        customerId: req.customer.id,
+        items: {
+          create: validatedItems.map((item) => ({
+            quantity: item.quantity,
+            price: item.price,
+            variant: { connect: { id: item.variantId } },
+          })),
+        },
+      },
+      include: {
+        customer: true,
+        items: {
+          include: {
+            variant: {
+              include: { product: true }
+            }
+          }
+        }
+      }
+    });
+
+    // 9. Decrement stock atomically
+    for (const item of validatedItems) {
+      await prisma.variant.update({
+        where: { id: item.variantId },
+        data: { stock: { decrement: item.quantity } }
+      });
     }
-    
-    res.json({ user: mapAdminUserForFrontend(user) });
+
+    res.json({
+      success: true,
+      order: mapOrderForFrontend(order, false),
+      message: 'Order created successfully. Proceed to payment.'
+    });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch user' });
+    console.error('[API] Customer order creation error:', error);
+    res.status(500).json({ error: 'Failed to create order', details: error.message });
   }
+});
+
+// Customer Support Query Submission
+app.post('/api/customer/order-consultants', authenticateCustomer, async (req, res) => {
+  try {
+    const { name, phone, whatsappNumber, email, address, city, state, pincode, cartItems, subtotal, requestedRegion } = req.body || {};
+    const cleanPhone = String(phone || req.customer.phone || '').replace(/\D/g, '').slice(-10);
+    if (!name || !email || !address || !city || !state || !/^\d{6}$/.test(String(pincode)) || cleanPhone.length !== 10) {
+      return res.status(400).json({ error: 'Complete customer and delivery details are required' });
+    }
+    const request = await prisma.orderConsultantRequest.create({
+      data: {
+        customerId: req.customer.id,
+        name: String(name).trim(), phone: cleanPhone,
+        whatsappNumber: whatsappNumber ? String(whatsappNumber).replace(/\D/g, '').slice(-10) : null,
+        email: String(email).trim().toLowerCase(), address: String(address).trim(),
+        city: String(city).trim(), state: String(state).trim(), pincode: String(pincode),
+        cartItems: Array.isArray(cartItems) ? cartItems : undefined,
+        subtotal: Number.isFinite(Number(subtotal)) ? Number(subtotal) : null,
+        requestedRegion: requestedRegion ? String(requestedRegion).trim() : null,
+      },
+    });
+    res.status(201).json({ success: true, requestId: request.id, message: 'Your delivery consultation request was sent to our team.' });
+  } catch (error) { res.status(500).json({ error: 'Failed to submit consultant request' }); }
+});
+
+app.get('/api/admin/order-consultants/count', authenticateAdmin, async (req, res) => {
+  res.json({ count: await prisma.orderConsultantRequest.count({ where: { status: 'NEW' } }) });
+});
+
+app.get('/api/admin/order-consultants', authenticateAdmin, async (req, res) => {
+  const requests = await prisma.orderConsultantRequest.findMany({ orderBy: { createdAt: 'desc' } });
+  res.json({ requests });
+});
+
+app.get('/api/admin/order-consultants/:id', authenticateAdmin, async (req, res) => {
+  const request = await prisma.orderConsultantRequest.findUnique({ where: { id: req.params.id } });
+  if (!request) return res.status(404).json({ error: 'Consultant request not found' });
+  res.json({ request });
+});
+
+app.put('/api/admin/order-consultants/:id', authenticateAdmin, async (req, res) => {
+  const allowed = ['NEW', 'CONTACTED', 'RESOLVED', 'CLOSED'];
+  const status = String(req.body?.status || '').toUpperCase();
+  if (!allowed.includes(status)) return res.status(400).json({ error: 'Invalid consultant request status' });
+  const request = await prisma.orderConsultantRequest.update({ where: { id: req.params.id }, data: { status } });
+  res.json({ request });
+});
+
+app.post('/api/customer/support', async (req, res) => {
+  try {
+    const { name, phone, whatsappNumber, email, queryType, description, customerId } = req.body;
+    if (!name || !phone || !email || !queryType || !description) {
+      return res.status(400).json({ error: 'Please provide all required fields (Name, Phone, Email, Query Category, Description)' });
+    }
+
+    const newQuery = await prisma.supportQuery.create({
+      data: {
+        name: String(name).trim(),
+        phone: String(phone).trim(),
+        whatsappNumber: whatsappNumber ? String(whatsappNumber).trim() : null,
+        email: String(email).trim().toLowerCase(),
+        queryType: String(queryType).trim(),
+        description: String(description).trim(),
+        status: 'OPEN',
+        customerId: customerId || null,
+      },
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Support query submitted successfully',
+      query: {
+        id: newQuery.id,
+        name: newQuery.name,
+        queryType: newQuery.queryType,
+        status: newQuery.status,
+        createdAt: newQuery.createdAt,
+      },
+    });
+  } catch (err) {
+    console.error('[API] /api/customer/support error:', err.message);
+    res.status(500).json({ error: 'Failed to record support query' });
+  }
+});
+
+// Featured Products: Recently Added
+app.get('/api/products/featured/recent', async (req, res) => {
+  try {
+    const limit = Math.min(12, Math.max(1, parseInt(req.query.limit) || 6));
+    const products = await prisma.product.findMany({
+      where: { isActive: true },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+      include: {
+        category: true,
+        subcategory: true,
+        variants: true,
+      },
+    });
+    res.json({ products: products.map(serializeProduct) });
+  } catch (err) {
+    console.error('[API] /api/products/featured/recent error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch recently added products' });
+  }
+});
+
+// Featured Products: Top Selling
+app.get('/api/products/featured/top-selling', async (req, res) => {
+  try {
+    const limit = Math.min(12, Math.max(1, parseInt(req.query.limit) || 6));
+    // Retrieve active products
+    const products = await prisma.product.findMany({
+      where: { isActive: true },
+      take: limit,
+      include: {
+        category: true,
+        subcategory: true,
+        variants: true,
+      },
+    });
+    res.json({ products: products.map(serializeProduct) });
+  } catch (err) {
+    console.error('[API] /api/products/featured/top-selling error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch top selling products' });
+  }
+});
+
+// ── Admin Auth Endpoints (Firebase Authenticated + Admin Role Check) ──────
+app.get('/api/auth/admin/me', authenticateAdmin, async (req, res) => {
+  res.json({ user: mapAdminUserForFrontend(req.adminUser) });
+});
+
+app.get('/api/auth/me', authenticateAdmin, async (req, res) => {
+  res.json({ user: mapAdminUserForFrontend(req.adminUser) });
 });
 
 const listRoutes = () => {
@@ -1753,8 +2349,9 @@ const listRoutes = () => {
 }
 
 const serializeProduct = (product) => {
-  if (!product) return product
-  const { category, subcategory, ...rest } = product
+  if (!product) return product;
+  // Strip internal business productNumber and technical SKU so customer web NEVER receives them
+  const { category, subcategory, productNumber, variants, ...rest } = product;
   return {
     ...rest,
     // Preserve the old contract expected by customer-web: `category` is a string.
@@ -1764,13 +2361,100 @@ const serializeProduct = (product) => {
     categoryDetails: category || null,
     subcategory: subcategory?.slug || rest.subcategoryId || null,
     subcategoryDetails: subcategory || null,
-  }
-}
+    variants: (variants || []).map((v) => {
+      const { sku, ...vRest } = v;
+      return vRest;
+    }),
+  };
+};
 
 app.get('/api/routes', authenticateToken, (req, res) => {
   res.json({ routes: listRoutes() })
 })
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+const HOST = process.env.HOST || '0.0.0.0';
+
+app.listen(PORT, HOST, () => {
+  console.log(`Server running on http://${HOST}:${PORT}`);
 });
+
+app.get('/api/admin/categories', authenticateAdmin, async (req, res) => {
+  try {
+    const categories = await prisma.category.findMany({
+      include: { subcategories: { orderBy: { name: 'asc' } } },
+      orderBy: { categoryNumber: 'asc' },
+    });
+    res.json({ categories });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch admin categories', details: error.message });
+  }
+});
+
+app.get('/api/admin/delivery/regions', authenticateAdmin, async (req, res) => {
+  const settings = await prisma.deliverySettings.findFirst({ include: { regions: { orderBy: { regionName: 'asc' } } } });
+  res.json(mapDeliverySettingsForFrontend(settings));
+});
+
+app.post('/api/admin/delivery/regions', authenticateAdmin, async (req, res) => {
+  try {
+    const { regionName, city, state, pincodeStart, pincodeEnd, deliveryCharge, isEnabled = true } = req.body || {};
+    if (!regionName || !city || !/^\d{6}$/.test(String(pincodeStart)) || !/^\d{6}$/.test(String(pincodeEnd))) {
+      return res.status(400).json({ error: 'Region, city, and valid six-digit pincode range are required' });
+    }
+    const settings = await prisma.deliverySettings.findFirst() || await prisma.deliverySettings.create({ data: { freeShippingThreshold: 1500, defaultShippingCharge: 50 } });
+    const region = await prisma.deliveryRegion.create({ data: { regionName: String(regionName).trim(), city: String(city).trim(), state: state ? String(state).trim() : null, pincode: String(pincodeStart), pincodeStart: String(pincodeStart), pincodeEnd: String(pincodeEnd), shippingCharge: Number(deliveryCharge), isActive: Boolean(isEnabled), deliverySettingsId: settings.id } });
+    res.status(201).json(region);
+  } catch (error) { res.status(400).json({ error: error.message || 'Failed to create delivery region' }); }
+});
+
+app.put('/api/admin/delivery/regions/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const allowed = ['regionName', 'city', 'state', 'pincodeStart', 'pincodeEnd', 'shippingCharge', 'isActive'];
+    const data = {};
+    for (const key of allowed) if (req.body?.[key] !== undefined) data[key] = req.body[key];
+    if (data.pincodeStart) data.pincode = data.pincodeStart;
+    if (data.shippingCharge !== undefined) data.shippingCharge = Number(data.shippingCharge);
+    const region = await prisma.deliveryRegion.update({ where: { id: req.params.id }, data });
+    res.json(region);
+  } catch (error) { res.status(400).json({ error: error.message || 'Failed to update delivery region' }); }
+});
+
+app.delete('/api/admin/delivery/regions/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const linked = await prisma.order.count({ where: { deliveryRegionId: req.params.id } });
+    if (linked > 0) return res.status(409).json({ error: 'Region is linked to existing orders; disable it instead' });
+    await prisma.deliveryRegion.delete({ where: { id: req.params.id } });
+    res.json({ success: true });
+  } catch (error) { res.status(400).json({ error: error.message || 'Failed to delete delivery region' }); }
+});
+
+// ── Admin: Payment Gateway Status (Safe Read-Only Dashboard Endpoint) ──
+app.get('/api/admin/payment-gateway-status', authenticateAdmin, async (req, res) => {
+  try {
+    const hasAppId = Boolean(process.env.CASHFREE_APP_ID && process.env.CASHFREE_APP_ID.trim());
+    const hasSecretKey = Boolean(process.env.CASHFREE_SECRET_KEY && process.env.CASHFREE_SECRET_KEY.trim());
+    const environment = process.env.CASHFREE_ENV === 'production' ? 'production' : 'sandbox';
+    const isConfigured = hasAppId && hasSecretKey;
+    const webhookConfigured = hasSecretKey;
+
+    res.json({
+      gateway: 'Cashfree Payments',
+      environment,
+      isConfigured,
+      webhookConfigured,
+      supportedMethods: [
+        'UPI Intent (Google Pay, PhonePe, Paytm, BHIM, CRED)',
+        'Dynamic UPI QR Code (Desktop Scan & Pay)',
+        'Credit & Debit Cards (Visa, Mastercard, RuPay)',
+        'Net Banking (50+ Indian Banks)',
+      ],
+      appIdConfigured: hasAppId,
+      secretKeyConfigured: hasSecretKey,
+      siteUrl: process.env.SITE_URL || '',
+      frontendUrl: process.env.FRONTEND_URL || '',
+      webhookUrl: `${(process.env.SITE_URL || 'http://localhost:3001').replace(/\/$/, '')}/api/payments/cashfree/webhook`,
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch payment gateway status', details: error.message });
+  }
+});
