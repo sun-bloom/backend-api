@@ -68,6 +68,14 @@ const isCorsOriginAllowed = (origin) => {
     const url = new URL(origin);
     // Always allow localhost in development.
     if (url.hostname === 'localhost' || url.hostname === '127.0.0.1') return true;
+    // Allow Cloudflare Pages deployments (*.pages.dev) and production domains
+    if (
+      url.hostname.endsWith('.pages.dev') ||
+      url.hostname === 'sunbloomadorn.com' ||
+      url.hostname.endsWith('.sunbloomadorn.com')
+    ) {
+      return true;
+    }
     return corsOriginAllowlist.has(origin);
   } catch {
     return false;
@@ -76,7 +84,9 @@ const isCorsOriginAllowed = (origin) => {
 
 const corsOptions = {
   origin: (origin, callback) => callback(null, isCorsOriginAllowed(origin)),
-  credentials: false,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
   optionsSuccessStatus: 204,
 };
 
