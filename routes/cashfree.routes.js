@@ -5,6 +5,7 @@
 const express = require('express');
 const axios   = require('axios');
 const router  = express.Router();
+const { matchDeliveryRegion, calculateShipping } = require('../lib/deliveryMatcher');
 
 // ── Cashfree config ────────────────────────────────────────────────────────
 const CF_BASE_URL = process.env.CASHFREE_ENV === 'production'
@@ -230,22 +231,21 @@ router.post('/create-order', async (req, res) => {
     }
 
     const deliverySettings = await prisma.deliverySettings.findFirst({ include: { regions: true } });
-    const activeRegions = (deliverySettings?.regions || []).filter((region) => region.isActive);
-    const numericPincode = Number(cleanPincode);
-    const matchedRegion = activeRegions.find((region) => {
-      const start = Number(region.pincodeStart || region.pincode || 0);
-      const end = Number(region.pincodeEnd || region.pincodeStart || region.pincode || 0);
-      return (start && end && numericPincode >= start && numericPincode <= end) || (region.city && region.city.toLowerCase() === cleanCity.toLowerCase());
-    });
+    // Pincode-primary matching — city is NOT used for matching
+    const matchedRegion = matchDeliveryRegion(deliverySettings?.regions || [], cleanPincode);
     if (!matchedRegion) {
-      return res.status(400).json({ message: `Delivery is currently unavailable for ${cleanCity}.`, deliveryUnavailable: true });
+      return res.status(400).json({
+        message: `Delivery is currently unavailable for pincode ${cleanPincode}. Please enter a supported delivery pincode.`,
+        deliveryUnavailable: true,
+      });
     }
 
     // Delivery charge and total are resolved from server configuration and prices.
-    const freeShippingThreshold = 1500;
-    const resolvedShipping = serverSubtotal >= freeShippingThreshold
-      ? 0
-      : Number(matchedRegion.shippingCharge || 0);
+    const { shippingCharge: resolvedShipping } = calculateShipping(
+      serverSubtotal,
+      deliverySettings,
+      matchedRegion
+    );
     const finalCalculatedTotal = serverSubtotal + resolvedShipping;
     const orderTotal = finalCalculatedTotal;
 

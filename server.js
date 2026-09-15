@@ -18,6 +18,7 @@ const pool = new Pool({
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 const app = express();
+const { matchDeliveryRegion, calculateShipping } = require('./lib/deliveryMatcher');
 app.locals.prisma = prisma; // shared with route files
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -95,69 +96,63 @@ app.get('/health', (req, res) => {
   res.status(200).json({ ok: true, timestamp: new Date().toISOString() });
 });
 
-// ── Cashfree: webhook must be mounted BEFORE express.json() (needs raw body) ──
-const { router: cashfreeRoutes, confirmOrderPayment } = require('./routes/cashfree.routes');
-// ── Cashfree Webhook — handled directly (raw body needed, no router) ────────
+// ── Razorpay: webhook must be mounted BEFORE express.json() (needs raw body) ──
+const { router: razorpayRoutes, confirmOrderPayment } = require('./routes/razorpay.routes');
 const crypto = require('crypto');
 
-// POST: actual payment webhook
-app.post('/api/payments/cashfree/webhook', express.raw({ type: '*/*' }), async (req, res) => {
+// POST: Razorpay payment webhook
+app.post('/api/payments/razorpay/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   try {
-    const timestamp = req.headers['x-webhook-timestamp'];
-    const signature = req.headers['x-webhook-signature'];
+    const signature = req.headers['x-razorpay-signature'];
     const rawBody   = req.body?.toString('utf8') || '';
 
-    if (!process.env.CASHFREE_SECRET_KEY) {
-      console.error('[Cashfree Webhook] CASHFREE_SECRET_KEY not configured on server.');
+    if (!process.env.RAZORPAY_KEY_SECRET) {
+      console.error('[Razorpay Webhook] RAZORPAY_KEY_SECRET not configured on server.');
       return res.status(500).json({ message: 'Server configuration error' });
     }
 
-    if (!timestamp || !signature) {
-      console.warn('[Cashfree Webhook] Missing signature headers');
+    if (!signature) {
+      console.warn('[Razorpay Webhook] Missing signature header');
       return res.status(401).json({ message: 'Missing signature' });
     }
 
     // Verify HMAC-SHA256 signature
     const expected = crypto
-      .createHmac('sha256', process.env.CASHFREE_SECRET_KEY)
-      .update(`${timestamp}${rawBody}`)
-      .digest('base64');
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+      .update(rawBody)
+      .digest('hex');
 
     if (expected !== signature) {
-      console.warn('[Cashfree Webhook] Signature mismatch');
+      console.warn('[Razorpay Webhook] Signature mismatch');
       return res.status(401).json({ message: 'Invalid signature' });
     }
 
     let event;
-    try {
-      event = JSON.parse(rawBody);
-    } catch (parseErr) {
-      console.warn('[Cashfree Webhook] Invalid JSON payload');
-      return res.status(400).json({ message: 'Invalid payload' });
+    try { event = JSON.parse(rawBody); }
+    catch { return res.status(400).json({ message: 'Invalid payload' }); }
+
+    const { event: eventType, payload } = event;
+    const rzpOrderId = payload?.payment?.entity?.order_id;
+
+    console.log(`[Razorpay Webhook] Event: ${eventType} — order: ${rzpOrderId}`);
+
+    if (eventType === 'payment.captured' && rzpOrderId) {
+      const confirmation = await confirmOrderPayment(prisma, rzpOrderId);
+      console.log(`[Razorpay Webhook] Order ${rzpOrderId} confirmed. Already processed: ${confirmation.alreadyProcessed}`);
     }
 
-    const { type, data } = event;
-    const cfOrderId = data?.order?.order_id;
-
-    console.log(`[Cashfree Webhook] Event: ${type} — order: ${cfOrderId}`);
-
-    if (type === 'PAYMENT_SUCCESS_WEBHOOK' && cfOrderId) {
-      const confirmation = await confirmOrderPayment(prisma, cfOrderId);
-      console.log(`[Cashfree Webhook] Order ${cfOrderId} confirmation complete. Already processed: ${confirmation.alreadyProcessed}`);
-    }
-
-    if (type === 'PAYMENT_FAILED_WEBHOOK' && cfOrderId) {
+    if (eventType === 'payment.failed' && rzpOrderId) {
       await prisma.order.updateMany({
-        where: { upiTransactionId: cfOrderId, paymentStatus: 'PENDING' },
+        where: { upiTransactionId: rzpOrderId, paymentStatus: 'PENDING' },
         data:  { paymentStatus: 'FAILED', status: 'CANCELLED' },
       });
-      console.log(`[Cashfree Webhook] Order ${cfOrderId} marked FAILED`);
+      console.log(`[Razorpay Webhook] Order ${rzpOrderId} marked FAILED`);
     }
 
     res.status(200).json({ status: 'ok' });
   } catch (err) {
-    console.error('[Cashfree Webhook] Webhook error:', err?.message || err);
-    res.status(200).json({ status: 'ok' }); // always 200 so Cashfree doesn't retry endlessly
+    console.error('[Razorpay Webhook] Webhook error:', err?.message || err);
+    res.status(200).json({ status: 'ok' }); // always 200 so Razorpay doesn't retry
   }
 });
 
@@ -165,10 +160,9 @@ app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ── Cashfree: remaining routes (create-order, confirm-order, status) use JSON body ──
-app.use('/api/payments/cashfree', cashfreeRoutes);
-// Express 5 + path-to-regexp does not accept "*" as a path pattern here.
-// Use a regex to enable CORS preflight handling for all routes.
+// ── Razorpay routes (create-order, verify-payment, status) ──────────────────
+app.use('/api/payments/razorpay', razorpayRoutes);
+// Preflight CORS
 app.options(/.*/, cors(corsOptions));
 
 const toIsoString = (value) => {
@@ -412,33 +406,19 @@ const normalizeSettingsInput = (body, existing) => {
 };
 
 const mapDeliverySettingsForFrontend = (settings) => {
-  const updatedAt = toIsoString(settings?.updatedAt) || toIsoString(new Date());
-  const regions = (settings?.regions || []).map((region) => {
-    const regionName =
-      region.regionName ||
-      (region.city && region.state
-        ? `${region.city}, ${region.state}`
-        : region.city || region.state || region.pincode || '');
-    return {
-      id: region.id,
-      regionName,
-      city: region.city || regionName,
-      state: region.state || '',
-      pincode: region.pincode || '',
-      pincodeStart: region.pincodeStart || region.pincode || '',
-      pincodeEnd: region.pincodeEnd || region.pincodeStart || region.pincode || '',
-      isEnabled: region.isActive,
-      deliveryCharge: region.shippingCharge,
-      estimatedDays: 7,
-      codAvailable: true,
-      createdAt: updatedAt,
-      updatedAt,
-    };
-  });
+  const regions = (settings?.regions || []).map((region) => ({
+    id: region.id,
+    city: region.city || '',
+    state: region.state || '',
+    pincodeStart: region.pincodeStart || region.pincode || '',
+    pincodeEnd: region.pincodeEnd || region.pincodeStart || region.pincode || '',
+    isEnabled: Boolean(region.isActive),
+    deliveryCharge: region.shippingCharge,
+  }));
 
   return {
-    freeShippingThreshold: settings?.freeShippingThreshold ?? 9999,
-    defaultShippingCharge: settings?.defaultShippingCharge ?? 100,
+    freeShippingThreshold: settings?.freeShippingThreshold ?? 1500,
+    defaultShippingCharge: settings?.defaultShippingCharge ?? 50,
     regions,
   };
 };
@@ -1833,6 +1813,72 @@ app.get('/api/delivery', async (req, res) => {
   }
 });
 
+app.post('/api/delivery/calculate', async (req, res) => {
+  try {
+    const { subtotal = 0, pincode } = req.body || {};
+    const cleanPin = String(pincode || '').trim().replace(/\D/g, '');
+
+    if (cleanPin.length !== 6) {
+      return res.status(400).json({
+        isSupported: false,
+        shippingCharge: 0,
+        isFreeShipping: false,
+        freeShippingThreshold: 1500,
+        message: 'Please enter a valid 6-digit pincode.',
+        matchedRegion: null,
+      });
+    }
+
+    const deliverySettings = await prisma.deliverySettings.findFirst({ include: { regions: true } });
+    const threshold = Number(deliverySettings?.freeShippingThreshold ?? 1500);
+    // Pincode-primary matching — city/state NOT used for matching
+    const matchedRegion = matchDeliveryRegion(deliverySettings?.regions || [], cleanPin);
+    const result = calculateShipping(Number(subtotal), deliverySettings, matchedRegion);
+
+    if (!result.isSupported) {
+      return res.json({
+        isSupported: false,
+        shippingCharge: 0,
+        isFreeShipping: false,
+        freeShippingThreshold: threshold,
+        message: `Delivery is currently unavailable for pincode ${cleanPin}.`,
+        matchedRegion: null,
+      });
+    }
+
+    return res.json({
+      isSupported: true,
+      shippingCharge: result.shippingCharge,
+      isFreeShipping: result.isFreeShipping,
+      freeShippingThreshold: threshold,
+      matchedRegion: {
+        city: matchedRegion.city,
+        state: matchedRegion.state || '',
+        pincodeStart: matchedRegion.pincodeStart,
+        pincodeEnd: matchedRegion.pincodeEnd,
+        shippingCharge: result.shippingCharge,
+      },
+    });
+  } catch (error) {
+    console.error('[Delivery Calculate] error:', error);
+    res.status(500).json({ error: 'Failed to calculate delivery fee' });
+  }
+});
+
+// Public endpoint: India state -> city list for admin/customer dropdowns
+app.get('/api/delivery/geo', (req, res) => {
+  try {
+    const { INDIA_STATES, STATE_CITIES } = require('./lib/indiaGeoData');
+    const { state } = req.query;
+    if (state) {
+      return res.json({ cities: STATE_CITIES[state] || [] });
+    }
+    return res.json({ states: INDIA_STATES });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load geo data' });
+  }
+});
+
 app.put('/api/delivery', authenticateAdmin, async (req, res) => {
   try {
     const existing = await prisma.deliverySettings.findFirst();
@@ -2051,35 +2097,16 @@ app.post('/api/customer/orders', authenticateCustomer, orderLimiter, async (req,
       return res.status(400).json({ error: 'Please confirm that the delivery address is correct before proceeding' });
     }
 
-    // 5. Validate delivery region & determine charge from DB
-    const searchRegion = String(deliveryRegionName || cleanCity).trim().toLowerCase();
-    const deliverySettings = await prisma.deliverySettings.findFirst({
-      include: { regions: true }
-    });
-
-    const activeRegions = (deliverySettings?.regions || []).filter((r) => r.isActive);
-    let matchedRegion = null;
-
-    if (deliveryRegionId) {
-      matchedRegion = activeRegions.find((r) => r.id === deliveryRegionId);
-    }
-    if (!matchedRegion) {
-      matchedRegion = activeRegions.find(
-        (r) =>
-          (r.regionName && r.regionName.toLowerCase() === searchRegion) ||
-          (r.city && r.city.toLowerCase() === searchRegion) ||
-          (cleanPincode && ((r.pincode && r.pincode === cleanPincode) || (Number(cleanPincode) >= Number(r.pincodeStart || r.pincode || 0) && Number(cleanPincode) <= Number(r.pincodeEnd || r.pincodeStart || r.pincode || 0))))
-      );
-    }
+    // 5. Validate delivery region by pincode (pincode-primary, city NOT used for matching)
+    const deliverySettings = await prisma.deliverySettings.findFirst({ include: { regions: true } });
+    const matchedRegion = matchDeliveryRegion(deliverySettings?.regions || [], cleanPincode);
 
     if (!matchedRegion) {
       return res.status(400).json({
-        error: `Delivery is currently unavailable for ${cleanCity || 'this location'}. Please choose a supported delivery region.`,
+        error: `Delivery is currently unavailable for pincode ${cleanPincode}. Please enter a supported delivery pincode.`,
         deliveryUnavailable: true,
       });
     }
-
-    const resolvedShippingCharge = Number(matchedRegion.shippingCharge);
 
     // 6. Validate items & recalculate prices from DB
     const variantIds = [...new Set(cartItems.map((i) => i.variantId).filter(Boolean))];
@@ -2135,6 +2162,11 @@ app.post('/api/customer/orders', authenticateCustomer, orderLimiter, async (req,
       });
     }
 
+    const { shippingCharge: resolvedShippingCharge } = calculateShipping(
+      serverSubtotal,
+      deliverySettings,
+      matchedRegion
+    );
     const finalTotal = serverSubtotal + resolvedShippingCharge;
     const orderNumber = `ORD-${Date.now()}`;
 
@@ -2407,26 +2439,79 @@ app.get('/api/admin/delivery/regions', authenticateAdmin, async (req, res) => {
 
 app.post('/api/admin/delivery/regions', authenticateAdmin, async (req, res) => {
   try {
-    const { regionName, city, state, pincodeStart, pincodeEnd, deliveryCharge, isEnabled = true } = req.body || {};
-    if (!regionName || !city || !/^\d{6}$/.test(String(pincodeStart)) || !/^\d{6}$/.test(String(pincodeEnd))) {
-      return res.status(400).json({ error: 'Region, city, and valid six-digit pincode range are required' });
+    const { city, state, pincodeStart, pincodeEnd, deliveryCharge, isEnabled = true } = req.body || {};
+    if (!city || !state) {
+      return res.status(400).json({ error: 'City and state are required' });
     }
-    const settings = await prisma.deliverySettings.findFirst() || await prisma.deliverySettings.create({ data: { freeShippingThreshold: 1500, defaultShippingCharge: 50 } });
-    const region = await prisma.deliveryRegion.create({ data: { regionName: String(regionName).trim(), city: String(city).trim(), state: state ? String(state).trim() : null, pincode: String(pincodeStart), pincodeStart: String(pincodeStart), pincodeEnd: String(pincodeEnd), shippingCharge: Number(deliveryCharge), isActive: Boolean(isEnabled), deliverySettingsId: settings.id } });
+    if (!/^\d{6}$/.test(String(pincodeStart)) || !/^\d{6}$/.test(String(pincodeEnd))) {
+      return res.status(400).json({ error: 'Valid 6-digit pincodeStart and pincodeEnd are required' });
+    }
+    if (parseInt(String(pincodeStart), 10) > parseInt(String(pincodeEnd), 10)) {
+      return res.status(400).json({ error: 'Pincode start must be less than or equal to pincode end' });
+    }
+    if (isNaN(Number(deliveryCharge)) || Number(deliveryCharge) < 0) {
+      return res.status(400).json({ error: 'Valid delivery charge is required' });
+    }
+    const settings = await prisma.deliverySettings.findFirst() ||
+      await prisma.deliverySettings.create({ data: { freeShippingThreshold: 1500, defaultShippingCharge: 50 } });
+    // Auto-generate regionName from city + state
+    const regionName = `${String(city).trim()}, ${String(state).trim()}`;
+    const region = await prisma.deliveryRegion.create({
+      data: {
+        regionName,
+        city: String(city).trim(),
+        state: String(state).trim(),
+        pincode: String(pincodeStart),
+        pincodeStart: String(pincodeStart),
+        pincodeEnd: String(pincodeEnd),
+        shippingCharge: Number(deliveryCharge),
+        isActive: Boolean(isEnabled),
+        deliverySettingsId: settings.id,
+      },
+    });
     res.status(201).json(region);
-  } catch (error) { res.status(400).json({ error: error.message || 'Failed to create delivery region' }); }
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Failed to create delivery region' });
+  }
 });
 
 app.put('/api/admin/delivery/regions/:id', authenticateAdmin, async (req, res) => {
   try {
-    const allowed = ['regionName', 'city', 'state', 'pincodeStart', 'pincodeEnd', 'shippingCharge', 'isActive'];
+    const { city, state, pincodeStart, pincodeEnd, deliveryCharge, isEnabled } = req.body || {};
     const data = {};
-    for (const key of allowed) if (req.body?.[key] !== undefined) data[key] = req.body[key];
-    if (data.pincodeStart) data.pincode = data.pincodeStart;
-    if (data.shippingCharge !== undefined) data.shippingCharge = Number(data.shippingCharge);
+    if (city !== undefined) {
+      data.city = String(city).trim();
+      // Regenerate regionName if city or state changes
+    }
+    if (state !== undefined) data.state = String(state).trim();
+    // Auto-regenerate regionName when city or state provided
+    if (city !== undefined || state !== undefined) {
+      const existing = await prisma.deliveryRegion.findUnique({ where: { id: req.params.id } });
+      const newCity = (city !== undefined ? String(city).trim() : existing?.city) || '';
+      const newState = (state !== undefined ? String(state).trim() : existing?.state) || '';
+      data.regionName = newState ? `${newCity}, ${newState}` : newCity;
+    }
+    if (pincodeStart !== undefined) {
+      if (!/^\d{6}$/.test(String(pincodeStart))) return res.status(400).json({ error: 'Invalid pincodeStart' });
+      data.pincodeStart = String(pincodeStart);
+      data.pincode = String(pincodeStart);
+    }
+    if (pincodeEnd !== undefined) {
+      if (!/^\d{6}$/.test(String(pincodeEnd))) return res.status(400).json({ error: 'Invalid pincodeEnd' });
+      data.pincodeEnd = String(pincodeEnd);
+    }
+    if (deliveryCharge !== undefined) {
+      if (isNaN(Number(deliveryCharge)) || Number(deliveryCharge) < 0) return res.status(400).json({ error: 'Invalid delivery charge' });
+      data.shippingCharge = Number(deliveryCharge);
+    }
+    if (isEnabled !== undefined) data.isActive = Boolean(isEnabled);
+    // Handle toggle from the list (sent as isActive directly)
+    if (req.body?.isActive !== undefined) data.isActive = Boolean(req.body.isActive);
     const region = await prisma.deliveryRegion.update({ where: { id: req.params.id }, data });
     res.json(region);
-  } catch (error) { res.status(400).json({ error: error.message || 'Failed to update delivery region' }); }
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Failed to update delivery region' });
+  }
 });
 
 app.delete('/api/admin/delivery/regions/:id', authenticateAdmin, async (req, res) => {
@@ -2441,28 +2526,28 @@ app.delete('/api/admin/delivery/regions/:id', authenticateAdmin, async (req, res
 // ── Admin: Payment Gateway Status (Safe Read-Only Dashboard Endpoint) ──
 app.get('/api/admin/payment-gateway-status', authenticateAdmin, async (req, res) => {
   try {
-    const hasAppId = Boolean(process.env.CASHFREE_APP_ID && process.env.CASHFREE_APP_ID.trim());
-    const hasSecretKey = Boolean(process.env.CASHFREE_SECRET_KEY && process.env.CASHFREE_SECRET_KEY.trim());
-    const environment = process.env.CASHFREE_ENV === 'production' ? 'production' : 'sandbox';
-    const isConfigured = hasAppId && hasSecretKey;
-    const webhookConfigured = hasSecretKey;
+    const hasKeyId     = Boolean(process.env.RAZORPAY_KEY_ID     && process.env.RAZORPAY_KEY_ID.trim());
+    const hasKeySecret = Boolean(process.env.RAZORPAY_KEY_SECRET && process.env.RAZORPAY_KEY_SECRET.trim());
+    const environment  = process.env.RAZORPAY_ENV === 'production' ? 'production' : 'test';
+    const isConfigured = hasKeyId && hasKeySecret;
 
     res.json({
-      gateway: 'Cashfree Payments',
+      gateway:             'Razorpay',
       environment,
       isConfigured,
-      webhookConfigured,
-      supportedMethods: [
-        'UPI Intent (Google Pay, PhonePe, Paytm, BHIM, CRED)',
-        'Dynamic UPI QR Code (Desktop Scan & Pay)',
+      webhookConfigured:   hasKeySecret,
+      supportedMethods:    [
+        'UPI (Google Pay, PhonePe, Paytm, BHIM)',
         'Credit & Debit Cards (Visa, Mastercard, RuPay)',
         'Net Banking (50+ Indian Banks)',
+        'EMI',
+        'UPI QR Code',
       ],
-      appIdConfigured: hasAppId,
-      secretKeyConfigured: hasSecretKey,
-      siteUrl: process.env.SITE_URL || '',
-      frontendUrl: process.env.FRONTEND_URL || '',
-      webhookUrl: `${(process.env.SITE_URL || 'http://localhost:3001').replace(/\/$/, '')}/api/payments/cashfree/webhook`,
+      keyIdConfigured:     hasKeyId,
+      keySecretConfigured: hasKeySecret,
+      siteUrl:             process.env.SITE_URL || '',
+      frontendUrl:         process.env.FRONTEND_URL || '',
+      webhookUrl:          `${(process.env.SITE_URL || 'http://localhost:3001').replace(/\/$/, '')}/api/payments/razorpay/webhook`,
     });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch payment gateway status', details: error.message });
