@@ -87,6 +87,7 @@ model Customer {
   orders         Order[]
   supportQueries SupportQuery[]
   consultantRequests OrderConsultantRequest[]
+  customerQueries CustomerQuery[]
 }
 
 model Order {
@@ -117,6 +118,7 @@ model Order {
   customer          Customer      @relation(fields: [customerId], references: [id])
   items             OrderItem[]
   deliveryRegion    DeliveryRegion? @relation(fields: [deliveryRegionId], references: [id], onDelete: SetNull)
+  customerQueries   CustomerQuery[]
 }
 
 model SupportQuery {
@@ -244,4 +246,45 @@ enum PaymentStatus {
   PAID
   FAILED
   REFUNDED
+}
+
+model CustomerQuery {
+  id          String   @id @default(cuid())
+  queryNumber String   @unique
+  customerId  String
+  orderId     String?
+  category    String
+  subject     String
+  status      String   @default("OPEN")
+  priority    String   @default("NORMAL")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  resolvedAt  DateTime?
+
+  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  order       Order?   @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  messages    CustomerQueryMessage[]
+
+  @@index([customerId])
+  @@index([status])
+  @@index([category])
+  @@index([priority])
+  @@index([createdAt])
+}
+
+model CustomerQueryMessage {
+  id         String   @id @default(cuid())
+  queryId    String
+  senderType String
+  senderId   String?
+  senderName String?
+  message    String
+  attachment String?
+  isInternal Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  query      CustomerQuery @relation(fields: [queryId], references: [id], onDelete: Cascade)
+
+  @@index([queryId])
+  @@index([createdAt])
 }

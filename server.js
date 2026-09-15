@@ -871,6 +871,11 @@ const authenticateToken = authenticateFirebaseToken;
 const mediaRoutes = require('./routes/media.routes');
 app.use('/api/admin/media', authenticateAdmin, mediaRoutes);
 
+// Customer Query & Support System Routes
+const { customerRouter, adminRouter } = require('./routes/customerQuery.routes');
+app.use('/api/customer/queries', authenticateCustomer, customerRouter);
+app.use('/api/admin/customer-queries', authenticateAdmin, adminRouter);
+
 if (PUBLIC_DOCS) {
   console.log('[DOCS] PUBLIC_DOCS=1: exposing /api/docs and /api/openapi.json without auth (local only).');
   app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
