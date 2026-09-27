@@ -1008,27 +1008,53 @@ app.delete('/api/categories/:id', authenticateAdmin, async (req, res) => {
 
     const existingCategory = await prisma.category.findUnique({
       where: { id: categoryId },
-      select: { id: true },
+      include: {
+        products: {
+          include: {
+            variants: {
+              include: {
+                orderItems: true,
+              },
+            },
+          },
+        },
+        subcategories: true,
+      },
     });
 
     if (!existingCategory) {
       return res.status(404).json({ error: 'Category not found' });
     }
 
-    await prisma.$transaction([
-      prisma.product.deleteMany({
-        where: { categoryId },
-      }),
-      prisma.subcategory.deleteMany({
-        where: { categoryId },
-      }),
-      prisma.category.delete({
-        where: { id: categoryId },
-      }),
-    ]);
+    // Safely remove associated orderItems and variants so foreign key constraints are satisfied
+    for (const product of existingCategory.products) {
+      for (const variant of product.variants) {
+        if (variant.orderItems && variant.orderItems.length > 0) {
+          await prisma.orderItem.deleteMany({
+            where: { variantId: variant.id },
+          });
+        }
+      }
+      await prisma.variant.deleteMany({
+        where: { productId: product.id },
+      });
+    }
 
-    res.json({ success: true });
+    await prisma.product.deleteMany({
+      where: { categoryId },
+    });
+
+    await prisma.subcategory.deleteMany({
+      where: { categoryId },
+    });
+
+    await prisma.category.delete({
+      where: { id: categoryId },
+    });
+
+    res.json({ success: true, message: 'Category deleted successfully' });
   } catch (error) {
+    console.error('[API] /api/categories/:id delete error:', error);
     res.status(500).json({ error: 'Failed to delete category', details: error.message });
   }
 });
@@ -1358,10 +1384,37 @@ app.put('/api/products/:id', authenticateAdmin, async (req, res) => {
 
 app.delete('/api/products/:id', authenticateAdmin, async (req, res) => {
   try {
-    await prisma.product.delete({
-      where: { id: req.params.id }
+    const productId = String(req.params.id);
+    const existing = await prisma.product.findUnique({
+      where: { id: productId },
+      include: {
+        variants: {
+          include: { orderItems: true },
+        },
+      },
     });
-    res.json({ success: true });
+
+    if (!existing) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
+    for (const variant of existing.variants) {
+      if (variant.orderItems && variant.orderItems.length > 0) {
+        await prisma.orderItem.deleteMany({
+          where: { variantId: variant.id },
+        });
+      }
+    }
+
+    await prisma.variant.deleteMany({
+      where: { productId },
+    });
+
+    await prisma.product.delete({
+      where: { id: productId },
+    });
+
+    res.json({ success: true, message: 'Product deleted successfully' });
   } catch (error) {
     console.error('[API] /api/products/:id delete error:', error);
     res.status(500).json({ error: 'Failed to delete product', details: error.message });
