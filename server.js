@@ -1026,15 +1026,29 @@ app.delete('/api/categories/:id', authenticateAdmin, async (req, res) => {
       return res.status(404).json({ error: 'Category not found' });
     }
 
-    // Safely remove associated orderItems and variants so foreign key constraints are satisfied
+    // Check if any product/variant in this category has historical order items
+    let totalOrderItems = 0;
+    const orderedProducts = [];
     for (const product of existingCategory.products) {
-      for (const variant of product.variants) {
-        if (variant.orderItems && variant.orderItems.length > 0) {
-          await prisma.orderItem.deleteMany({
-            where: { variantId: variant.id },
-          });
-        }
+      const orderCount = product.variants.reduce((sum, v) => sum + (v.orderItems?.length || 0), 0);
+      if (orderCount > 0) {
+        totalOrderItems += orderCount;
+        orderedProducts.push({ id: product.id, name: product.name, orderCount });
       }
+    }
+
+    if (totalOrderItems > 0) {
+      return res.status(400).json({
+        error: 'CANNOT_DELETE_ORDERED_CATEGORY',
+        message: `Cannot delete category "${existingCategory.name}" because ${orderedProducts.length} product(s) in this category are referenced in ${totalOrderItems} customer order item(s). Reassign or deactivate these products to preserve customer order records.`,
+        hasOrders: true,
+        orderedProducts,
+        totalOrderItems,
+      });
+    }
+
+    // Safely remove variants and products since NONE of them have historical orders
+    for (const product of existingCategory.products) {
       await prisma.variant.deleteMany({
         where: { productId: product.id },
       });
@@ -1062,7 +1076,7 @@ app.delete('/api/categories/:id', authenticateAdmin, async (req, res) => {
 app.get('/api/products', async (req, res) => {
   try {
     const { categoryId, categorySlug, subcategoryId, subcategorySlug } = req.query;
-    const where = {};
+    const where = { isActive: true };
     if (categoryId) where.categoryId = String(categoryId);
     if (categorySlug) where.category = { slug: String(categorySlug) };
     if (subcategoryId) where.subcategoryId = String(subcategoryId);
@@ -1398,12 +1412,18 @@ app.delete('/api/products/:id', authenticateAdmin, async (req, res) => {
       return res.status(404).json({ error: 'Product not found' });
     }
 
-    for (const variant of existing.variants) {
-      if (variant.orderItems && variant.orderItems.length > 0) {
-        await prisma.orderItem.deleteMany({
-          where: { variantId: variant.id },
-        });
-      }
+    const orderItemCount = existing.variants.reduce(
+      (sum, v) => sum + (v.orderItems?.length || 0),
+      0
+    );
+
+    if (orderItemCount > 0) {
+      return res.status(400).json({
+        error: 'CANNOT_DELETE_ORDERED_PRODUCT',
+        message: `Cannot permanently delete product "${existing.name}" because it is referenced in ${orderItemCount} historical customer order item(s). Deactivate the product (set active status to false) instead to preserve customer order histories and financial records.`,
+        hasOrders: true,
+        orderItemCount,
+      });
     }
 
     await prisma.variant.deleteMany({
