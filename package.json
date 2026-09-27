@@ -33,8 +33,8 @@
     "firebase-admin": "^14.4.0",
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.3.0",
+    "node-fetch": "^3.3.2",
     "pg": "^8.23.0",
-    "razorpay": "^2.9.8",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",
     "ws": "^8.19.0"

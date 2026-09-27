@@ -105,11 +105,13 @@ model Order {
   paymentMethod     String
   paymentStatus     PaymentStatus @default(PENDING)
   upiTransactionId  String?
+  gatewayReference  String?
   trackingCarrier   String?
   trackingNumber    String?
   trackingUrl       String?
   trackingRequested Boolean       @default(false)
   whatsappNumber    String?
+  whatsappNotifiedAt DateTime?
   shippedAt         DateTime?
   deliveredAt       DateTime?
   customerId        String

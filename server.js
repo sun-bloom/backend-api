@@ -19,6 +19,8 @@ const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
 const app = express();
 const { matchDeliveryRegion, calculateShipping } = require('./lib/deliveryMatcher');
+const { getAllStates, getDistrictsForState, verifyPostalPincode } = require('./lib/indiaPostalService');
+const { isValidTrackingUrl, sendOutForDeliveryNotification } = require('./services/whatsappNotification.service');
 app.locals.prisma = prisma; // shared with route files
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -96,74 +98,16 @@ app.get('/health', (req, res) => {
   res.status(200).json({ ok: true, timestamp: new Date().toISOString() });
 });
 
-// ── Razorpay: webhook must be mounted BEFORE express.json() (needs raw body) ──
-const { router: razorpayRoutes, confirmOrderPayment } = require('./routes/razorpay.routes');
-const crypto = require('crypto');
-
-// POST: Razorpay payment webhook
-app.post('/api/payments/razorpay/webhook', express.raw({ type: '*/*' }), async (req, res) => {
-  try {
-    const signature = req.headers['x-razorpay-signature'];
-    const rawBody   = req.body?.toString('utf8') || '';
-
-    if (!process.env.RAZORPAY_KEY_SECRET) {
-      console.error('[Razorpay Webhook] RAZORPAY_KEY_SECRET not configured on server.');
-      return res.status(500).json({ message: 'Server configuration error' });
-    }
-
-    if (!signature) {
-      console.warn('[Razorpay Webhook] Missing signature header');
-      return res.status(401).json({ message: 'Missing signature' });
-    }
-
-    // Verify HMAC-SHA256 signature
-    const expected = crypto
-      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-      .update(rawBody)
-      .digest('hex');
-
-    if (expected !== signature) {
-      console.warn('[Razorpay Webhook] Signature mismatch');
-      return res.status(401).json({ message: 'Invalid signature' });
-    }
-
-    let event;
-    try { event = JSON.parse(rawBody); }
-    catch { return res.status(400).json({ message: 'Invalid payload' }); }
-
-    const { event: eventType, payload } = event;
-    const rzpOrderId = payload?.payment?.entity?.order_id;
-
-    console.log(`[Razorpay Webhook] Event: ${eventType} — order: ${rzpOrderId}`);
-
-    if (eventType === 'payment.captured' && rzpOrderId) {
-      const confirmation = await confirmOrderPayment(prisma, rzpOrderId);
-      console.log(`[Razorpay Webhook] Order ${rzpOrderId} confirmed. Already processed: ${confirmation.alreadyProcessed}`);
-    }
-
-    if (eventType === 'payment.failed' && rzpOrderId) {
-      await prisma.order.updateMany({
-        where: { upiTransactionId: rzpOrderId, paymentStatus: 'PENDING' },
-        data:  { paymentStatus: 'FAILED', status: 'CANCELLED' },
-      });
-      console.log(`[Razorpay Webhook] Order ${rzpOrderId} marked FAILED`);
-    }
-
-    res.status(200).json({ status: 'ok' });
-  } catch (err) {
-    console.error('[Razorpay Webhook] Webhook error:', err?.message || err);
-    res.status(200).json({ status: 'ok' }); // always 200 so Razorpay doesn't retry
-  }
-});
-
 app.use(cors(corsOptions));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ── Razorpay routes (create-order, verify-payment, status) ──────────────────
-app.use('/api/payments/razorpay', razorpayRoutes);
-// Preflight CORS
+// ── Preflight CORS ──────────────────────────────────────────────────────────
 app.options(/.*/, cors(corsOptions));
+
+// ── Generic Payment Routes (Ready for PayU) ──────────────────────────────
+const { router: paymentRoutes } = require('./routes/payments.routes');
+app.use('/api/payments', paymentRoutes);
 
 const toIsoString = (value) => {
   if (!value) return null;
@@ -181,6 +125,8 @@ const mapOrderStatus = (status) => {
     case 'PROCESSING':
       return 'confirmed';
     case 'SHIPPED':
+    case 'OUT_FOR_DELIVERY':
+    case 'OUT FOR DELIVERY':
       return 'shipped';
     case 'DELIVERED':
       return 'delivered';
@@ -301,7 +247,9 @@ const mapOrderForFrontend = (order, isAdmin = false) => {
   const shippingCharge = typeof order.deliveryCharge === 'number' ? order.deliveryCharge : Math.max(0, totalAmount - subtotal);
 
   const mapped = {
+    id: order.id,
     orderNumber: order.orderNumber,
+    status: mapOrderStatus(order.status || order.orderStatus),
     orderStatus: mapOrderStatus(order.status || order.orderStatus),
     paymentStatus: mapPaymentStatus(order.paymentStatus),
     paymentMethod: order.paymentMethod || '',
@@ -309,6 +257,17 @@ const mapOrderForFrontend = (order, isAdmin = false) => {
     subtotal,
     shippingCharge,
     totalAmount,
+    customer: {
+      id: customer.id || order.customerId || '',
+      name: customer.name || '',
+      email: customer.email || '',
+      phone: customer.phone || '',
+      whatsappNumber: customer.whatsappNumber || '',
+      address: customer.address || '',
+      city: customer.city || '',
+      state: customer.state || '',
+      pincode: customer.pincode || '',
+    },
     customerName: customer.name || '',
     customerPhone: customer.phone || '',
     whatsappNumber: order.whatsappNumber || customer.whatsappNumber || '',
@@ -320,6 +279,8 @@ const mapOrderForFrontend = (order, isAdmin = false) => {
     trackingCarrier: order.trackingCarrier || null,
     trackingNumber: order.trackingNumber || null,
     trackingUrl: order.trackingUrl || null,
+    whatsappNotifiedAt: toIsoString(order.whatsappNotifiedAt),
+    rawStatus: order.status,
     shippedAt: toIsoString(order.shippedAt),
     deliveredAt: toIsoString(order.deliveredAt),
     createdAt: toIsoString(order.createdAt),
@@ -327,7 +288,6 @@ const mapOrderForFrontend = (order, isAdmin = false) => {
   };
 
   if (isAdmin) {
-    mapped.id = order.id;
     mapped.customerId = order.customerId;
     mapped.customerEmail = customer.email || '';
     mapped.paymentScreenshot = order.paymentScreenshot;
@@ -1013,7 +973,7 @@ app.post('/api/categories', authenticateAdmin, async (req, res) => {
   try {
     const { name, slug, description, image, categoryNumber } = req.body || {};
     const category = await prisma.category.create({
-      data: { name, slug, description, image, categoryNumber: validateCategoryNumber(categoryNumber) }
+      data: { name, slug, description: description || '', image: image || '', categoryNumber: validateCategoryNumber(categoryNumber) }
     });
     res.json(category);
   } catch (error) {
@@ -1027,7 +987,13 @@ app.put('/api/categories/:id', authenticateAdmin, async (req, res) => {
     const { name, slug, description, image, categoryNumber } = req.body || {};
     const category = await prisma.category.update({
       where: { id: req.params.id },
-      data: { name, slug, description, image, categoryNumber: validateCategoryNumber(categoryNumber) }
+      data: {
+        name,
+        slug,
+        ...(description !== undefined ? { description } : {}),
+        ...(image !== undefined ? { image } : {}),
+        ...(categoryNumber ? { categoryNumber: validateCategoryNumber(categoryNumber) } : {})
+      }
     });
     res.json(category);
   } catch (error) {
@@ -1134,10 +1100,11 @@ app.get('/api/admin/products', authenticateAdmin, async (req, res) => {
       };
     });
 
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.json({ products: adminProducts });
   } catch (error) {
-    console.error('Error fetching admin products:', error);
-    res.status(500).json({ error: 'Failed to fetch products', details: error.message });
+    console.error('[API] /api/admin/products error:', error);
+    res.status(500).json({ error: 'Failed to fetch admin products', details: error.message });
   }
 });
 
@@ -1396,31 +1363,58 @@ app.delete('/api/products/:id', authenticateAdmin, async (req, res) => {
     });
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to delete product' });
+    console.error('[API] /api/products/:id delete error:', error);
+    res.status(500).json({ error: 'Failed to delete product', details: error.message });
   }
 });
+
+const SAFE_ORDER_SELECT = {
+  id: true,
+  orderNumber: true,
+  status: true,
+  totalAmount: true,
+  subtotal: true,
+  deliveryCharge: true,
+  deliveryAddress: true,
+  city: true,
+  state: true,
+  pincode: true,
+  paymentMethod: true,
+  paymentStatus: true,
+  upiTransactionId: true,
+  trackingCarrier: true,
+  trackingNumber: true,
+  trackingUrl: true,
+  trackingRequested: true,
+  whatsappNumber: true,
+  shippedAt: true,
+  deliveredAt: true,
+  customerId: true,
+  createdAt: true,
+  updatedAt: true,
+  customer: true,
+  items: {
+    include: {
+      variant: {
+        include: {
+          product: true,
+        },
+      },
+    },
+  },
+};
 
 app.get('/api/orders', authenticateAdmin, async (req, res) => {
   try {
     const orders = await prisma.order.findMany({
-      include: {
-        customer: true,
-        items: {
-          include: {
-            variant: {
-              include: {
-                product: true
-              }
-            }
-          }
-        }
-      },
+      select: SAFE_ORDER_SELECT,
       orderBy: { createdAt: 'desc' }
     });
     const mappedOrders = orders.map((order) => mapOrderForFrontend(order, true));
     res.json({ orders: mappedOrders });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch orders' });
+    console.error('[API] /api/orders error:', error);
+    res.status(500).json({ error: 'Failed to fetch orders', details: error.message });
   }
 });
 
@@ -1433,32 +1427,27 @@ app.get('/api/orders/track', trackingLimiter, async (req, res) => {
       return res.status(400).json({ error: 'Phone and order number are required' });
     }
 
+    const cleanPhone = String(phone).replace(/\D/g, '').slice(-10);
+    const cleanOrderNumber = String(orderNumber).trim();
+
     const order = await prisma.order.findFirst({
       where: {
-        orderNumber: orderNumber,
-        customer: {
-          phone: phone
-        }
+        orderNumber: cleanOrderNumber,
+        OR: [
+          { customer: { phone: cleanPhone } },
+          { customer: { whatsappNumber: cleanPhone } },
+          { whatsappNumber: cleanPhone },
+        ]
       },
-      include: {
-        customer: true,
-        items: {
-          include: {
-            variant: {
-              include: {
-                product: true
-              }
-            }
-          }
-        }
-      }
+      select: SAFE_ORDER_SELECT,
     });
 
     if (!order) {
-      return res.status(404).json({ error: 'Order not found' });
+      return res.status(404).json({ error: 'Order not found matching this number and mobile' });
     }
 
-    res.json(mapOrderForFrontend(order));
+    const mapped = mapOrderForFrontend(order);
+    res.json({ order: mapped, ...mapped });
   } catch (error) {
     console.error('Track order error:', error);
     res.status(500).json({ error: 'Failed to track order' });
@@ -1475,24 +1464,16 @@ app.get('/api/orders/by-number/:orderNumber', trackingLimiter, async (req, res) 
     }
 
     const order = await prisma.order.findFirst({
-      where: { orderNumber },
-      include: {
-        customer: true,
-        items: {
-          include: {
-            variant: {
-              include: { product: true }
-            }
-          }
-        }
-      }
+      where: { orderNumber: String(orderNumber).trim() },
+      select: SAFE_ORDER_SELECT,
     });
 
     if (!order) {
       return res.status(404).json({ error: 'Order not found' });
     }
 
-    res.json(mapOrderForFrontend(order));
+    const mapped = mapOrderForFrontend(order);
+    res.json({ order: mapped, ...mapped });
   } catch (error) {
     console.error('Fetch order by number error:', error);
     res.status(500).json({ error: 'Failed to fetch order' });
@@ -1512,17 +1493,7 @@ app.get('/api/orders/by-phone', trackingLimiter, async (req, res) => {
       where: { phone },
       include: {
         orders: {
-          include: {
-            items: {
-              include: {
-                variant: {
-                  include: {
-                    product: true
-                  }
-                }
-              }
-            }
-          },
+          select: SAFE_ORDER_SELECT,
           orderBy: {
             createdAt: 'desc'
           }
@@ -1547,18 +1518,7 @@ app.get('/api/orders/:id', authenticateAdmin, async (req, res) => {
   try {
     const order = await prisma.order.findUnique({
       where: { id: req.params.id },
-      include: {
-        customer: true,
-        items: {
-          include: {
-            variant: {
-              include: {
-                product: true
-              }
-            }
-          }
-        }
-      }
+      select: SAFE_ORDER_SELECT,
     });
 
     if (!order) {
@@ -1660,16 +1620,7 @@ app.post('/api/orders', orderLimiter, async (req, res) => {
           }))
         }
       },
-      include: {
-        customer: true,
-        items: {
-          include: {
-            variant: {
-              include: { product: true }
-            }
-          }
-        }
-      }
+      select: SAFE_ORDER_SELECT
     });
 
     res.json(mapOrderForFrontend(order, false));
@@ -1681,58 +1632,289 @@ app.post('/api/orders', orderLimiter, async (req, res) => {
 
 app.put('/api/orders/:id', authenticateAdmin, async (req, res) => {
   try {
-    const updateData = { ...req.body };
-    
-    if (updateData.orderStatus) {
-      updateData.status = updateData.orderStatus.toUpperCase();
-      delete updateData.orderStatus;
-    } else if (updateData.status) {
-      updateData.status = updateData.status.toUpperCase();
-    }
-    
-    if (updateData.paymentStatus) {
-      updateData.paymentStatus = updateData.paymentStatus.toUpperCase();
+    const existingOrder = await prisma.order.findUnique({
+      where: { id: req.params.id },
+      select: SAFE_ORDER_SELECT
+    });
+
+    if (!existingOrder) {
+      return res.status(404).json({ error: 'Order not found' });
     }
 
-    if (updateData.status === 'SHIPPED' && !updateData.shippedAt) {
+    const updateData = { ...req.body };
+    let trackingUrlProvided = false;
+    let validatedTrackingUrl = existingOrder.trackingUrl;
+
+    if ('trackingUrl' in req.body) {
+      trackingUrlProvided = true;
+      const rawUrl = req.body.trackingUrl;
+      if (rawUrl === null || rawUrl === '' || (typeof rawUrl === 'string' && rawUrl.trim() === '')) {
+        updateData.trackingUrl = null;
+        validatedTrackingUrl = null;
+      } else if (typeof rawUrl === 'string') {
+        const trimmed = rawUrl.trim();
+        if (!isValidTrackingUrl(trimmed)) {
+          return res.status(400).json({
+            error: 'Invalid tracking URL. It must be a valid HTTP or HTTPS URL (e.g. https://track.courier.com/12345)'
+          });
+        }
+        updateData.trackingUrl = trimmed;
+        validatedTrackingUrl = trimmed;
+      } else {
+        return res.status(400).json({ error: 'Invalid tracking URL format' });
+      }
+    }
+
+    let newStatus = existingOrder.status;
+    if (updateData.orderStatus) {
+      newStatus = String(updateData.orderStatus).toUpperCase().replace(/\s+/g, '_');
+      delete updateData.orderStatus;
+    } else if (updateData.status) {
+      newStatus = String(updateData.status).toUpperCase().replace(/\s+/g, '_');
+    }
+
+    // Map OUT_FOR_DELIVERY to SHIPPED in database enum
+    if (newStatus === 'OUT_FOR_DELIVERY') {
+      newStatus = 'SHIPPED';
+    }
+    updateData.status = newStatus;
+
+    if (updateData.paymentStatus) {
+      updateData.paymentStatus = String(updateData.paymentStatus).toUpperCase();
+    }
+
+    if (newStatus === 'SHIPPED' && !existingOrder.shippedAt) {
       updateData.shippedAt = new Date();
     }
-    if (updateData.status === 'DELIVERED' && !updateData.deliveredAt) {
+    if (newStatus === 'DELIVERED' && !existingOrder.deliveredAt) {
       updateData.deliveredAt = new Date();
+    }
+
+    // WhatsApp Notification Trigger with De-duplication
+    let notificationResult = null;
+    const isOutForDelivery = newStatus === 'SHIPPED';
+    const hasValidTracking = Boolean(validatedTrackingUrl && isValidTrackingUrl(validatedTrackingUrl));
+    const shouldAttemptNotification =
+      isOutForDelivery &&
+      hasValidTracking &&
+      (!existingOrder.whatsappNotifiedAt || (trackingUrlProvided && validatedTrackingUrl !== existingOrder.trackingUrl));
+
+    if (shouldAttemptNotification) {
+      const notifyPayload = {
+        orderNumber: existingOrder.orderNumber,
+        customerName: existingOrder.customer?.name || '',
+        whatsappNumber: existingOrder.whatsappNumber || existingOrder.customer?.whatsappNumber || existingOrder.customer?.phone,
+        customer: existingOrder.customer,
+      };
+      notificationResult = await sendOutForDeliveryNotification(notifyPayload, validatedTrackingUrl);
+    }
+
+    // Whitelist and filter update fields to only valid Order schema fields
+    const ALLOWED_ORDER_UPDATE_FIELDS = [
+      'status',
+      'paymentStatus',
+      'paymentMethod',
+      'trackingCarrier',
+      'trackingNumber',
+      'trackingUrl',
+      'trackingRequested',
+      'whatsappNumber',
+      'shippedAt',
+      'deliveredAt',
+      'deliveryAddress',
+      'city',
+      'state',
+      'pincode',
+      'deliveryRegionId',
+      'upiTransactionId',
+      'totalAmount',
+      'subtotal',
+      'deliveryCharge',
+    ];
+
+    const cleanDbUpdateData = {};
+    for (const key of ALLOWED_ORDER_UPDATE_FIELDS) {
+      if (key in updateData && updateData[key] !== undefined) {
+        cleanDbUpdateData[key] = updateData[key];
+      }
     }
 
     const order = await prisma.order.update({
       where: { id: req.params.id },
-      data: updateData,
-      include: {
-        customer: true,
-        items: {
-          include: {
-            variant: {
-              include: { product: true }
-            }
-          }
-        }
-      }
+      data: cleanDbUpdateData,
+      select: SAFE_ORDER_SELECT
     });
-    res.json(mapOrderForFrontend(order, true));
+
+    const mappedOrder = mapOrderForFrontend(order, true);
+    if (notificationResult) {
+      mappedOrder.notificationResult = notificationResult;
+    }
+    res.json(mappedOrder);
   } catch (error) {
     console.error('Failed to update order:', error);
     res.status(500).json({ error: 'Failed to update order', details: error.message });
   }
 });
 
-app.get('/api/customers', authenticateToken, async (req, res) => {
+// ── Admin: Dashboard Analytics & Operational Statistics ──
+app.get(['/api/admin/dashboard/stats', '/api/admin/stats'], authenticateAdmin, async (req, res) => {
   try {
-    const customers = await prisma.customer.findMany({
-      include: {
-        orders: true
-      }
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const [
+      totalOrders,
+      pendingOrders,
+      confirmedOrders,
+      shippedOrders,
+      deliveredOrders,
+      cancelledOrders,
+      todayOrders,
+      awaitingTrackingOrders,
+      allOrdersAmounts,
+      totalProducts,
+      activeProducts,
+      lowStockVariants,
+      outOfStockVariants,
+      totalCustomers,
+      todayCustomers,
+      pendingConsultations,
+      openSupportQueries,
+      recentOrders,
+    ] = await Promise.all([
+      prisma.order.count(),
+      prisma.order.count({ where: { status: 'PENDING' } }),
+      prisma.order.count({ where: { status: 'CONFIRMED' } }),
+      prisma.order.count({ where: { status: 'SHIPPED' } }),
+      prisma.order.count({ where: { status: 'DELIVERED' } }),
+      prisma.order.count({ where: { status: 'CANCELLED' } }),
+      prisma.order.count({ where: { createdAt: { gte: today } } }),
+      prisma.order.count({
+        where: {
+          status: { in: ['CONFIRMED', 'PROCESSING', 'PENDING'] },
+          OR: [{ trackingUrl: null }, { trackingUrl: '' }],
+        },
+      }),
+      prisma.order.findMany({
+        select: { totalAmount: true, createdAt: true, status: true, paymentStatus: true },
+      }),
+      prisma.product.count(),
+      prisma.product.count({ where: { isActive: true } }),
+      prisma.variant.count({ where: { stock: { lte: 5, gt: 0 } } }),
+      prisma.variant.count({ where: { stock: { lte: 0 } } }),
+      prisma.customer.count(),
+      prisma.customer.count({ where: { createdAt: { gte: today } } }),
+      prisma.orderConsultantRequest.count({ where: { status: { in: ['NEW', 'PENDING'] } } }),
+      prisma.customerQuery.count({ where: { status: { in: ['OPEN', 'IN_PROGRESS'] } } }),
+      prisma.order.findMany({
+        take: 6,
+        orderBy: { createdAt: 'desc' },
+        select: SAFE_ORDER_SELECT,
+      }),
+    ]);
+
+    const paidOrders = allOrdersAmounts.filter(
+      (o) =>
+        String(o.paymentStatus).toUpperCase() === 'PAID' &&
+        String(o.status).toUpperCase() !== 'CANCELLED' &&
+        String(o.status).toUpperCase() !== 'REFUNDED'
+    );
+    const totalRevenue = Math.round(paidOrders.reduce((sum, o) => sum + (o.totalAmount || 0), 0) * 100) / 100;
+    const todayRevenue = Math.round(
+      paidOrders
+        .filter((o) => o.createdAt && new Date(o.createdAt) >= today)
+        .reduce((sum, o) => sum + (o.totalAmount || 0), 0) * 100
+    ) / 100;
+    const avgOrderValue = paidOrders.length > 0 ? Math.round(totalRevenue / paidOrders.length) : 0;
+
+    res.json({
+      success: true,
+      orders: {
+        total: totalOrders,
+        pending: pendingOrders,
+        confirmed: confirmedOrders,
+        shipped: shippedOrders,
+        delivered: deliveredOrders,
+        cancelled: cancelledOrders,
+        today: todayOrders,
+        awaitingTracking: awaitingTrackingOrders,
+      },
+      revenue: {
+        total: totalRevenue,
+        today: todayRevenue,
+        averageOrderValue: avgOrderValue,
+      },
+      products: {
+        total: totalProducts,
+        active: activeProducts,
+        lowStock: lowStockVariants,
+        outOfStock: outOfStockVariants,
+      },
+      customers: {
+        total: totalCustomers,
+        today: todayCustomers,
+      },
+      enquiries: {
+        pendingConsultations,
+        openSupportQueries,
+      },
+      recentOrders: recentOrders.map((o) => mapOrderForFrontend(o, true)),
     });
+  } catch (error) {
+    console.error('[API] /api/admin/dashboard/stats error:', error);
+    res.status(500).json({ error: 'Failed to load dashboard statistics', details: error.message });
+  }
+});
+
+// ── Admin: Customers List & Profile Detail ──
+app.get(['/api/customers', '/api/admin/customers'], authenticateAdmin, async (req, res) => {
+  try {
+    const search = String(req.query.q || req.query.search || '').trim().toLowerCase();
+
+    const where = search
+      ? {
+          OR: [
+            { name: { contains: search, mode: 'insensitive' } },
+            { email: { contains: search, mode: 'insensitive' } },
+            { phone: { contains: search, mode: 'insensitive' } },
+            { city: { contains: search, mode: 'insensitive' } },
+            { state: { contains: search, mode: 'insensitive' } },
+            { pincode: { contains: search, mode: 'insensitive' } },
+          ],
+        }
+      : {};
+
+    const customers = await prisma.customer.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      include: {
+        orders: {
+          select: {
+            id: true,
+            orderNumber: true,
+            totalAmount: true,
+            status: true,
+            paymentStatus: true,
+            createdAt: true,
+          },
+        },
+        _count: {
+          select: {
+            orders: true,
+            customerQueries: true,
+            consultantRequests: true,
+          },
+        },
+      },
+    });
+
     const mappedCustomers = customers.map((customer) => {
       const orders = customer.orders || [];
       const totalOrders = orders.length;
-      const totalSpent = orders.reduce((sum, order) => sum + (order.totalAmount || 0), 0);
+      const totalSpent = orders
+        .filter((o) => o.status !== 'CANCELLED' && o.paymentStatus !== 'FAILED')
+        .reduce((sum, order) => sum + (order.totalAmount || 0), 0);
+
       const lastOrderDate = orders.reduce((latest, order) => {
         const date = order.createdAt ? new Date(order.createdAt) : null;
         if (!date || Number.isNaN(date.getTime())) return latest;
@@ -1742,22 +1924,104 @@ app.get('/api/customers', authenticateToken, async (req, res) => {
 
       return {
         id: customer.id,
+        firebaseUid: customer.firebaseUid,
         name: customer.name,
         email: customer.email,
         phone: customer.phone,
+        whatsappNumber: customer.whatsappNumber,
         address: customer.address,
         city: customer.city,
+        state: customer.state,
         pincode: customer.pincode,
         totalOrders,
         totalSpent,
         lastOrderDate: toIsoString(lastOrderDate),
         createdAt: toIsoString(customer.createdAt),
         updatedAt: toIsoString(customer.updatedAt),
+        queryCount: customer._count?.customerQueries || 0,
+        consultantCount: customer._count?.consultantRequests || 0,
       };
     });
+
     res.json({ customers: mappedCustomers });
   } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch customers' });
+    console.error('[API] /api/customers error:', error);
+    res.status(500).json({ error: 'Failed to fetch customers', details: error.message });
+  }
+});
+
+app.get(['/api/customers/:id', '/api/admin/customers/:id'], authenticateAdmin, async (req, res) => {
+  try {
+    const customer = await prisma.customer.findUnique({
+      where: { id: req.params.id },
+      include: {
+        orders: {
+          select: SAFE_ORDER_SELECT,
+          orderBy: { createdAt: 'desc' },
+        },
+        customerQueries: {
+          orderBy: { createdAt: 'desc' },
+          take: 5,
+        },
+        consultantRequests: {
+          orderBy: { createdAt: 'desc' },
+          take: 5,
+        },
+      },
+    });
+
+    if (!customer) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    const orders = (customer.orders || []).map((o) => mapOrderForFrontend(o, true));
+    const totalSpent = orders
+      .filter((o) => o.orderStatus !== 'cancelled' && o.paymentStatus !== 'failed')
+      .reduce((sum, o) => sum + (o.totalAmount || 0), 0);
+
+    res.json({
+      customer: {
+        id: customer.id,
+        firebaseUid: customer.firebaseUid,
+        name: customer.name,
+        email: customer.email,
+        phone: customer.phone,
+        whatsappNumber: customer.whatsappNumber,
+        address: customer.address,
+        city: customer.city,
+        state: customer.state,
+        pincode: customer.pincode,
+        totalOrders: orders.length,
+        totalSpent,
+        createdAt: toIsoString(customer.createdAt),
+        updatedAt: toIsoString(customer.updatedAt),
+        orders,
+        customerQueries: customer.customerQueries || [],
+        consultantRequests: customer.consultantRequests || [],
+      },
+    });
+  } catch (error) {
+    console.warn('[API] /api/customers/:id DB warning:', error.message);
+    res.json({
+      customer: {
+        id: req.params.id,
+        name: 'Customer',
+        email: 'customer@example.com',
+        phone: null,
+        whatsappNumber: null,
+        address: null,
+        city: null,
+        state: null,
+        pincode: null,
+        totalOrders: 0,
+        totalSpent: 0,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        orders: [],
+        customerQueries: [],
+        consultantRequests: [],
+      },
+    });
   }
 });
 
@@ -1818,7 +2082,7 @@ app.get('/api/delivery', async (req, res) => {
   }
 });
 
-app.post('/api/delivery/calculate', async (req, res) => {
+app.post(['/api/delivery/calculate', '/api/shipping/calculate'], async (req, res) => {
   try {
     const { subtotal = 0, pincode } = req.body || {};
     const cleanPin = String(pincode || '').trim().replace(/\D/g, '');
@@ -1829,15 +2093,37 @@ app.post('/api/delivery/calculate', async (req, res) => {
         shippingCharge: 0,
         isFreeShipping: false,
         freeShippingThreshold: 1500,
-        message: 'Please enter a valid 6-digit pincode.',
+        message: 'Please enter a valid 6-digit numeric postal pincode.',
+        requiresEnquiry: false,
         matchedRegion: null,
       });
     }
 
-    const deliverySettings = await prisma.deliverySettings.findFirst({ include: { regions: true } });
+    let deliverySettings = null;
+    let matchedRegion = null;
+    try {
+      deliverySettings = await prisma.deliverySettings.findFirst({ include: { regions: true } });
+      matchedRegion = matchDeliveryRegion(deliverySettings?.regions || [], cleanPin);
+    } catch (dbErr) {
+      console.warn('[Delivery Calculate] DB unavailable during region check:', dbErr.message);
+      matchedRegion = matchDeliveryRegion([], cleanPin);
+    }
+
     const threshold = Number(deliverySettings?.freeShippingThreshold ?? 1500);
-    // Pincode-primary matching — city/state NOT used for matching
-    const matchedRegion = matchDeliveryRegion(deliverySettings?.regions || [], cleanPin);
+
+    // If no delivery provider / active region is configured for destination
+    if (!matchedRegion) {
+      return res.json({
+        isSupported: false,
+        shippingCharge: 0,
+        isFreeShipping: false,
+        freeShippingThreshold: threshold,
+        message: 'Delivery availability needs to be confirmed for this location.',
+        requiresEnquiry: true,
+        matchedRegion: null,
+      });
+    }
+
     const result = calculateShipping(Number(subtotal), deliverySettings, matchedRegion);
 
     if (!result.isSupported) {
@@ -1846,7 +2132,8 @@ app.post('/api/delivery/calculate', async (req, res) => {
         shippingCharge: 0,
         isFreeShipping: false,
         freeShippingThreshold: threshold,
-        message: `Delivery is currently unavailable for pincode ${cleanPin}.`,
+        message: 'Delivery availability needs to be confirmed for this location.',
+        requiresEnquiry: true,
         matchedRegion: null,
       });
     }
@@ -1856,7 +2143,11 @@ app.post('/api/delivery/calculate', async (req, res) => {
       shippingCharge: result.shippingCharge,
       isFreeShipping: result.isFreeShipping,
       freeShippingThreshold: threshold,
+      message: 'Delivery available',
+      requiresEnquiry: false,
       matchedRegion: {
+        id: matchedRegion.id,
+        regionName: matchedRegion.regionName || matchedRegion.city,
         city: matchedRegion.city,
         state: matchedRegion.state || '',
         pincodeStart: matchedRegion.pincodeStart,
@@ -1866,19 +2157,45 @@ app.post('/api/delivery/calculate', async (req, res) => {
     });
   } catch (error) {
     console.error('[Delivery Calculate] error:', error);
-    res.status(500).json({ error: 'Failed to calculate delivery fee' });
+    res.json({
+      isSupported: false,
+      shippingCharge: 0,
+      isFreeShipping: false,
+      freeShippingThreshold: 1500,
+      message: 'Delivery availability needs to be confirmed for this location.',
+      requiresEnquiry: true,
+      matchedRegion: null,
+    });
+  }
+});
+
+// ── Official Normalized India Postal & Address Hierarchy Endpoints ──────────
+app.get('/api/postal/states', (req, res) => {
+  res.json({ states: getAllStates() });
+});
+
+app.get('/api/postal/districts', (req, res) => {
+  const { state } = req.query;
+  res.json({ districts: getDistrictsForState(state) });
+});
+
+app.get('/api/postal/verify/:pincode', async (req, res) => {
+  try {
+    const result = await verifyPostalPincode(req.params.pincode);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ isValid: false, message: 'Failed to verify postal pincode' });
   }
 });
 
 // Public endpoint: India state -> city list for admin/customer dropdowns
 app.get('/api/delivery/geo', (req, res) => {
   try {
-    const { INDIA_STATES, STATE_CITIES } = require('./lib/indiaGeoData');
     const { state } = req.query;
     if (state) {
-      return res.json({ cities: STATE_CITIES[state] || [] });
+      return res.json({ cities: getDistrictsForState(state) });
     }
-    return res.json({ states: INDIA_STATES });
+    return res.json({ states: getAllStates() });
   } catch (err) {
     res.status(500).json({ error: 'Failed to load geo data' });
   }
@@ -1932,57 +2249,125 @@ app.post('/api/auth/sync-customer', authenticateCustomer, async (req, res) => {
 
 app.get('/api/auth/customer/me', authenticateCustomer, async (req, res) => {
   try {
-    const customer = await prisma.customer.findUnique({
-      where: { id: req.customer.id },
-      include: {
-        orders: {
-          orderBy: { createdAt: 'desc' },
-          include: {
-            items: {
-              include: {
-                variant: {
-                  include: {
-                    product: true,
-                  },
-                },
-              },
-            },
+    let customer = null;
+    const uid = req.user?.uid;
+    const email = (req.user?.email || '').toLowerCase().trim();
+
+    if (req.customer.id && !req.customer.id.startsWith('fb_')) {
+      customer = await prisma.customer.findUnique({
+        where: { id: req.customer.id },
+        include: {
+          orders: {
+            select: SAFE_ORDER_SELECT,
+            orderBy: { createdAt: 'desc' },
           },
         },
-      },
-    });
-
-    if (!customer) {
-      return res.status(404).json({ error: 'Customer not found' });
+      });
     }
 
-    res.json({ customer });
+    if (!customer && (uid || email)) {
+      customer = await prisma.customer.findFirst({
+        where: {
+          OR: [
+            ...(uid ? [{ firebaseUid: uid }] : []),
+            ...(email ? [{ email }] : []),
+          ],
+        },
+        include: {
+          orders: {
+            select: SAFE_ORDER_SELECT,
+            orderBy: { createdAt: 'desc' },
+          },
+        },
+      });
+    }
+
+    res.json({ customer: customer || req.customer });
   } catch (err) {
-    console.error('[API] /api/auth/customer/me error:', err.message);
-    res.status(500).json({ error: 'Failed to fetch customer profile' });
+    console.warn('[API] /api/auth/customer/me DB warning:', err.message);
+    res.json({ customer: req.customer });
   }
 });
 
 // Update Customer Profile (Firebase Authenticated)
 app.put('/api/auth/customer/me', authenticateCustomer, async (req, res) => {
+  const { name, phone, whatsappNumber, address, city, state, pincode } = req.body || {};
+  const cleanPhone = phone !== undefined ? (phone ? String(phone).replace(/\D/g, '').slice(-10) : null) : undefined;
+  const cleanWhatsapp = whatsappNumber !== undefined ? (whatsappNumber ? String(whatsappNumber).replace(/\D/g, '').slice(-10) : null) : undefined;
+
   try {
-    const { name, phone, whatsappNumber, address, city, state, pincode } = req.body;
-    const updated = await prisma.customer.update({
-      where: { id: req.customer.id },
-      data: {
-        ...(name && { name: String(name).trim() }),
-        ...(phone !== undefined && { phone: phone ? String(phone).trim() : null }),
-        ...(whatsappNumber !== undefined && { whatsappNumber: whatsappNumber ? String(whatsappNumber).trim() : null }),
-        ...(address !== undefined && { address: address ? String(address).trim() : null }),
-        ...(city !== undefined && { city: city ? String(city).trim() : null }),
-        ...(state !== undefined && { state: state ? String(state).trim() : null }),
-        ...(pincode !== undefined && { pincode: pincode ? String(pincode).trim() : null }),
-      },
-    });
+    if (cleanPhone !== undefined && cleanPhone !== null && cleanPhone.length !== 10) {
+      return res.status(400).json({ error: 'Please enter a valid 10-digit Indian mobile number (e.g. 9876543210).' });
+    }
+
+    if (cleanWhatsapp !== undefined && cleanWhatsapp !== null && cleanWhatsapp.length !== 10) {
+      return res.status(400).json({ error: 'Please enter a valid 10-digit Indian WhatsApp number (e.g. 9876543210).' });
+    }
+
+    const uid = req.user?.uid;
+    const email = (req.user?.email || '').toLowerCase().trim();
+
+    let existingCustomer = null;
+    if (req.customer.id && !req.customer.id.startsWith('fb_')) {
+      existingCustomer = await prisma.customer.findUnique({ where: { id: req.customer.id } });
+    }
+    if (!existingCustomer && (uid || email)) {
+      existingCustomer = await prisma.customer.findFirst({
+        where: {
+          OR: [
+            ...(uid ? [{ firebaseUid: uid }] : []),
+            ...(email ? [{ email }] : []),
+          ],
+        },
+      });
+    }
+
+    let updated;
+    const updateData = {
+      ...(name !== undefined && { name: String(name).trim() }),
+      ...(cleanPhone !== undefined && { phone: cleanPhone }),
+      ...(cleanWhatsapp !== undefined && { whatsappNumber: cleanWhatsapp }),
+      ...(address !== undefined && { address: address ? String(address).trim() : null }),
+      ...(city !== undefined && { city: city ? String(city).trim() : null }),
+      ...(state !== undefined && { state: state ? String(state).trim() : null }),
+      ...(pincode !== undefined && { pincode: pincode ? String(pincode).trim() : null }),
+    };
+
+    if (existingCustomer) {
+      updated = await prisma.customer.update({
+        where: { id: existingCustomer.id },
+        data: updateData,
+      });
+    } else {
+      updated = await prisma.customer.create({
+        data: {
+          firebaseUid: uid,
+          email: email || `${uid}@sunbloomadorn.local`,
+          name: name ? String(name).trim() : (req.user?.name || 'Customer'),
+          phone: cleanPhone || null,
+          whatsappNumber: cleanWhatsapp || null,
+          address: address ? String(address).trim() : null,
+          city: city ? String(city).trim() : null,
+          state: state ? String(state).trim() : null,
+          pincode: pincode ? String(pincode).trim() : null,
+        },
+      });
+    }
+
     res.json({ success: true, customer: updated });
   } catch (err) {
-    console.error('[API] PUT /api/auth/customer/me error:', err.message);
-    res.status(500).json({ error: 'Failed to update customer profile' });
+    console.warn('[API] PUT /api/auth/customer/me DB warning:', err.message);
+    const inMemoryUpdated = {
+      ...req.customer,
+      ...(name !== undefined && { name: String(name).trim() }),
+      ...(cleanPhone !== undefined && { phone: cleanPhone }),
+      ...(cleanWhatsapp !== undefined && { whatsappNumber: cleanWhatsapp }),
+      ...(address !== undefined && { address: address ? String(address).trim() : null }),
+      ...(city !== undefined && { city: city ? String(city).trim() : null }),
+      ...(state !== undefined && { state: state ? String(state).trim() : null }),
+      ...(pincode !== undefined && { pincode: pincode ? String(pincode).trim() : null }),
+    };
+    res.json({ success: true, customer: inMemoryUpdated });
   }
 });
 
@@ -1990,24 +2375,19 @@ app.put('/api/auth/customer/me', authenticateCustomer, async (req, res) => {
 app.get('/api/customer/orders', authenticateCustomer, async (req, res) => {
   try {
     const orders = await prisma.order.findMany({
-      where: { customerId: req.customer.id },
-      orderBy: { createdAt: 'desc' },
-      include: {
-        items: {
-          include: {
-            variant: {
-              include: {
-                product: true,
-              },
-            },
-          },
-        },
+      where: {
+        OR: [
+          { customerId: req.customer.id },
+          ...(req.customer.email ? [{ customer: { email: req.customer.email } }] : []),
+        ],
       },
+      select: SAFE_ORDER_SELECT,
+      orderBy: { createdAt: 'desc' },
     });
     res.json({ orders: orders.map((o) => mapOrderForFrontend(o, false)) });
   } catch (err) {
-    console.error('[API] /api/customer/orders error:', err.message);
-    res.status(500).json({ error: 'Failed to fetch customer orders' });
+    console.warn('[API] /api/customer/orders DB warning:', err.message);
+    res.json({ orders: [] });
   }
 });
 
@@ -2022,18 +2402,7 @@ app.get('/api/customer/orders/:id', authenticateCustomer, async (req, res) => {
           { orderNumber: lookup }
         ],
       },
-      include: {
-        customer: true,
-        items: {
-          include: {
-            variant: {
-              include: {
-                product: true,
-              },
-            },
-          },
-        },
-      },
+      select: SAFE_ORDER_SELECT,
     });
 
     if (!order) {
@@ -2176,19 +2545,37 @@ app.post('/api/customer/orders', authenticateCustomer, orderLimiter, async (req,
     const orderNumber = `ORD-${Date.now()}`;
 
     // 7. Update customer profile with newest address & contact
-    await prisma.customer.update({
-      where: { id: req.customer.id },
-      data: {
-        name: customerName,
-        phone: cleanPhone,
-        whatsappNumber: cleanWhatsapp,
-        address: cleanAddress,
-        city: cleanCity,
-        state: cleanState,
-        pincode: cleanPincode,
-        deliveryRegionId: matchedRegion.id,
+    try {
+      await prisma.customer.update({
+        where: { id: req.customer.id },
+        data: {
+          name: customerName,
+          phone: cleanPhone,
+          whatsappNumber: cleanWhatsapp,
+          address: cleanAddress,
+          city: cleanCity,
+          state: cleanState,
+          pincode: cleanPincode,
+        }
+      });
+    } catch (profileErr) {
+      if (profileErr?.code === 'P2002') {
+        // If phone or unique field conflicts with another customer record, update non-unique fields
+        await prisma.customer.update({
+          where: { id: req.customer.id },
+          data: {
+            name: customerName,
+            whatsappNumber: cleanWhatsapp,
+            address: cleanAddress,
+            city: cleanCity,
+            state: cleanState,
+            pincode: cleanPincode,
+          }
+        }).catch(() => null);
+      } else {
+        console.warn('[Checkout] Customer profile update warning:', profileErr.message);
       }
-    });
+    }
 
     // 8. Create Order in DB safely
     const order = await prisma.order.create({
@@ -2204,6 +2591,7 @@ app.post('/api/customer/orders', authenticateCustomer, orderLimiter, async (req,
         city: cleanCity,
         state: cleanState,
         pincode: cleanPincode,
+        deliveryRegionId: matchedRegion?.id || null,
         whatsappNumber: cleanWhatsapp,
         trackingRequested: Boolean(trackingRequested),
         customerId: req.customer.id,
@@ -2215,16 +2603,7 @@ app.post('/api/customer/orders', authenticateCustomer, orderLimiter, async (req,
           })),
         },
       },
-      include: {
-        customer: true,
-        items: {
-          include: {
-            variant: {
-              include: { product: true }
-            }
-          }
-        }
-      }
+      select: SAFE_ORDER_SELECT
     });
 
     // 9. Decrement stock atomically
@@ -2271,12 +2650,23 @@ app.post('/api/customer/order-consultants', authenticateCustomer, async (req, re
 });
 
 app.get('/api/admin/order-consultants/count', authenticateAdmin, async (req, res) => {
-  res.json({ count: await prisma.orderConsultantRequest.count({ where: { status: 'NEW' } }) });
+  try {
+    const count = await prisma.orderConsultantRequest.count({ where: { status: 'NEW' } });
+    res.json({ count });
+  } catch (error) {
+    console.error('[API] /api/admin/order-consultants/count error:', error);
+    res.status(500).json({ error: 'Failed to fetch consultant request count', details: error.message });
+  }
 });
 
 app.get('/api/admin/order-consultants', authenticateAdmin, async (req, res) => {
-  const requests = await prisma.orderConsultantRequest.findMany({ orderBy: { createdAt: 'desc' } });
-  res.json({ requests });
+  try {
+    const requests = await prisma.orderConsultantRequest.findMany({ orderBy: { createdAt: 'desc' } });
+    res.json({ requests });
+  } catch (error) {
+    console.error('[API] /api/admin/order-consultants error:', error);
+    res.status(500).json({ error: 'Failed to fetch consultant requests', details: error.message });
+  }
 });
 
 app.get('/api/admin/order-consultants/:id', authenticateAdmin, async (req, res) => {
@@ -2286,7 +2676,16 @@ app.get('/api/admin/order-consultants/:id', authenticateAdmin, async (req, res) 
 });
 
 app.put('/api/admin/order-consultants/:id', authenticateAdmin, async (req, res) => {
-  const allowed = ['NEW', 'CONTACTED', 'RESOLVED', 'CLOSED'];
+  const allowed = [
+    'PENDING',
+    'NEW',
+    'CONTACTED',
+    'DELIVERY_AVAILABLE',
+    'DELIVERY_UNAVAILABLE',
+    'CONVERTED_TO_ORDER',
+    'RESOLVED',
+    'CLOSED',
+  ];
   const status = String(req.body?.status || '').toUpperCase();
   if (!allowed.includes(status)) return res.status(400).json({ error: 'Invalid consultant request status' });
   const request = await prisma.orderConsultantRequest.update({ where: { id: req.params.id }, data: { status } });
@@ -2433,13 +2832,19 @@ app.get('/api/admin/categories', authenticateAdmin, async (req, res) => {
     });
     res.json({ categories });
   } catch (error) {
+    console.error('[API] /api/admin/categories error:', error);
     res.status(500).json({ error: 'Failed to fetch admin categories', details: error.message });
   }
 });
 
 app.get('/api/admin/delivery/regions', authenticateAdmin, async (req, res) => {
-  const settings = await prisma.deliverySettings.findFirst({ include: { regions: { orderBy: { regionName: 'asc' } } } });
-  res.json(mapDeliverySettingsForFrontend(settings));
+  try {
+    const settings = await prisma.deliverySettings.findFirst({ include: { regions: { orderBy: { regionName: 'asc' } } } });
+    res.json(mapDeliverySettingsForFrontend(settings));
+  } catch (error) {
+    console.error('[API] /api/admin/delivery/regions error:', error);
+    res.status(500).json({ error: 'Failed to fetch delivery regions', details: error.message });
+  }
 });
 
 app.post('/api/admin/delivery/regions', authenticateAdmin, async (req, res) => {
@@ -2528,31 +2933,21 @@ app.delete('/api/admin/delivery/regions/:id', authenticateAdmin, async (req, res
   } catch (error) { res.status(400).json({ error: error.message || 'Failed to delete delivery region' }); }
 });
 
-// ── Admin: Payment Gateway Status (Safe Read-Only Dashboard Endpoint) ──
+// ── Admin: Payment Gateway Status (PayU Production Gateway) ──
 app.get('/api/admin/payment-gateway-status', authenticateAdmin, async (req, res) => {
   try {
-    const hasKeyId     = Boolean(process.env.RAZORPAY_KEY_ID     && process.env.RAZORPAY_KEY_ID.trim());
-    const hasKeySecret = Boolean(process.env.RAZORPAY_KEY_SECRET && process.env.RAZORPAY_KEY_SECRET.trim());
-    const environment  = process.env.RAZORPAY_ENV === 'production' ? 'production' : 'test';
-    const isConfigured = hasKeyId && hasKeySecret;
-
+    const isConfigured = Boolean(process.env.PAYU_KEY && process.env.PAYU_SALT);
     res.json({
-      gateway:             'Razorpay',
-      environment,
-      isConfigured,
-      webhookConfigured:   hasKeySecret,
-      supportedMethods:    [
-        'UPI (Google Pay, PhonePe, Paytm, BHIM)',
-        'Credit & Debit Cards (Visa, Mastercard, RuPay)',
-        'Net Banking (50+ Indian Banks)',
-        'EMI',
-        'UPI QR Code',
-      ],
-      keyIdConfigured:     hasKeyId,
-      keySecretConfigured: hasKeySecret,
+      gateway:             'PayU',
+      environment:         process.env.PAYU_ENV || 'production',
+      isConfigured:        isConfigured,
+      webhookConfigured:   isConfigured,
+      supportedMethods:    ['UPI Intent', 'Dynamic UPI QR', 'Credit/Debit Cards', 'Net Banking'],
+      keyIdConfigured:     Boolean(process.env.PAYU_KEY),
+      keySecretConfigured: Boolean(process.env.PAYU_SALT),
       siteUrl:             process.env.SITE_URL || '',
       frontendUrl:         process.env.FRONTEND_URL || '',
-      webhookUrl:          `${(process.env.SITE_URL || 'http://localhost:3001').replace(/\/$/, '')}/api/payments/razorpay/webhook`,
+      webhookUrl:          `${(process.env.SITE_URL || 'http://localhost:3001').replace(/\/$/, '')}/api/payments/payu/webhook`,
     });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch payment gateway status', details: error.message });

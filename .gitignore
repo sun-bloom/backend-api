@@ -11,3 +11,7 @@ node_modules
 # Codex workspace artifacts
 .codex
 .codex/
+
+# Local runtime data & scratch files
+data/
+scratch/
