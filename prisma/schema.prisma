@@ -57,7 +57,7 @@ model Product {
 model Variant {
   id              String      @id @default(cuid())
   color           String
-  pattern         String
+  pattern         String?
   stock           Int
   additionalPrice Float       @default(0)
   variantNumber   String?

@@ -228,7 +228,7 @@ const mapOrderForFrontend = (order, isAdmin = false) => {
       totalPrice,
       image,
       variant:
-        variant.color && variant.pattern ? `${variant.color} / ${variant.pattern}` : variant.color || variant.pattern,
+        variant.color && variant.pattern ? `${variant.color} / ${variant.pattern}` : variant.color || variant.pattern || 'Standard',
     };
 
     if (isAdmin) {
@@ -1205,13 +1205,23 @@ app.post('/api/products', authenticateAdmin, async (req, res) => {
     if (sequence > 99) return res.status(409).json({ error: 'No Product Number available for this category' });
     productData.productNumber = `${categoryNumber}-${String(sequence).padStart(2, '0')}`;
 
+    let candidateSlug = toSlug(productData.slug || productData.name);
+    if (!candidateSlug) candidateSlug = `product-${Date.now()}`;
+    let slug = candidateSlug;
+    let slugSuffix = 1;
+    while (await prisma.product.findUnique({ where: { slug } })) {
+      slug = `${candidateSlug}-${slugSuffix}`;
+      slugSuffix += 1;
+    }
+    productData.slug = slug;
+
     const variantNumbers = validateVariantNumbers(variants || []);
     const processedVariants = (variants || []).map((v, idx) => {
       const vNum = variantNumbers[idx];
       const sku = v.sku || `${productData.productNumber}-V${vNum}-${Date.now().toString().slice(-4)}${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
       return {
         color: v.color || 'Standard',
-        pattern: v.pattern || 'Classic',
+        pattern: v.pattern && String(v.pattern).trim() !== '' ? String(v.pattern).trim() : null,
         stock: Number(v.stock) || 0,
         additionalPrice: Number(v.additionalPrice) || 0,
         variantNumber: vNum,
@@ -1280,6 +1290,23 @@ app.put('/api/products/:id', authenticateAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Product Number must be supplied when changing category' });
     }
 
+    if (productData.slug !== undefined) {
+      if (productData.slug && productData.slug.trim()) {
+        productData.slug = toSlug(productData.slug);
+      } else {
+        const candidate = toSlug(productData.name || existingProduct.name) || existingProduct.slug;
+        let slug = candidate;
+        let slugSuffix = 1;
+        while (true) {
+          const conflict = await prisma.product.findUnique({ where: { slug } });
+          if (!conflict || conflict.id === productId) break;
+          slug = `${candidate}-${slugSuffix}`;
+          slugSuffix += 1;
+        }
+        productData.slug = slug;
+      }
+    }
+
     if (Array.isArray(variants)) {
       const existingVariants = await prisma.variant.findMany({
         where: { productId }
@@ -1294,7 +1321,7 @@ app.put('/api/products/:id', authenticateAdmin, async (req, res) => {
         return {
           id: v.id || undefined,
           color: v.color || 'Standard',
-          pattern: v.pattern || 'Classic',
+          pattern: v.pattern && String(v.pattern).trim() !== '' ? String(v.pattern).trim() : null,
           stock: Number(v.stock) || 0,
           additionalPrice: Number(v.additionalPrice) || 0,
           variantNumber: vNum,
