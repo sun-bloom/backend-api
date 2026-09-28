@@ -13,6 +13,7 @@ router.post('/create-order', async (req, res) => {
 
     // 1. Authoritative Email Resolution from Authenticated Session
     let authEmail = null;
+    let authUid = null;
     const authHeader = req.headers['authorization'];
     if (authHeader && authHeader.startsWith('Bearer ')) {
       try {
@@ -20,8 +21,11 @@ router.post('/create-order', async (req, res) => {
         const auth = getAuth();
         if (auth) {
           const decoded = await auth.verifyIdToken(token);
-          if (decoded && decoded.email) {
-            authEmail = decoded.email.trim().toLowerCase();
+          if (decoded) {
+            authUid = decoded.uid;
+            if (decoded.email) {
+              authEmail = decoded.email.trim().toLowerCase();
+            }
           }
         }
       } catch (tokenErr) {
@@ -36,7 +40,7 @@ router.post('/create-order', async (req, res) => {
     }
 
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(customerEmail)) {
-      return res.status(400).json({ message: 'A valid authenticated email is required for checkout.' });
+      return res.status(400).json({ message: 'A valid email is required for checkout.' });
     }
 
     // 2. Strict Indian Mobile & WhatsApp Number Validation (Exact 10 digits starting with 6-9)
@@ -156,16 +160,35 @@ router.post('/create-order', async (req, res) => {
     if (dbAvailable) {
       try {
         // Find or create customer
-        let existingCustomer = await prisma.customer.findFirst({
-          where: { OR: [{ phone: cleanPhone }, { email: customerEmail }] },
-        });
+        // Primary identity: authenticated Firebase UID
+        let existingCustomer = null;
+        if (authUid) {
+          existingCustomer = await prisma.customer.findUnique({
+            where: { firebaseUid: authUid },
+          });
+        }
+
+        if (!existingCustomer) {
+          // If not found by firebaseUid, look for an unlinked legacy customer record
+          const candidates = await prisma.customer.findMany({
+            where: {
+              OR: [
+                { phone: cleanPhone },
+                ...(customerEmail ? [{ email: customerEmail }] : []),
+              ],
+            },
+          });
+          // Pick candidate that is either already unlinked or matching
+          existingCustomer = candidates.find((c) => c.firebaseUid === authUid || !c.firebaseUid);
+        }
 
         if (existingCustomer) {
           existingCustomer = await prisma.customer.update({
             where: { id: existingCustomer.id },
             data: {
+              firebaseUid:    existingCustomer.firebaseUid || authUid || undefined,
               name:           customer.name.trim(),
-              email:          customerEmail,
+              email:          customerEmail || existingCustomer.email || null,
               phone:          cleanPhone,
               whatsappNumber: cleanWhatsapp || existingCustomer.whatsappNumber || null,
               address:        cleanAddress,
@@ -177,6 +200,7 @@ router.post('/create-order', async (req, res) => {
         } else {
           existingCustomer = await prisma.customer.create({
             data: {
+              firebaseUid:    authUid || null,
               name:           customer.name.trim(),
               email:          customerEmail,
               phone:          cleanPhone,

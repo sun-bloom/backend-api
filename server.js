@@ -2403,9 +2403,20 @@ app.get('/api/auth/customer/me', authenticateCustomer, async (req, res) => {
 
 // Update Customer Profile (Firebase Authenticated)
 app.put('/api/auth/customer/me', authenticateCustomer, async (req, res) => {
-  const { name, phone, whatsappNumber, address, city, state, pincode } = req.body || {};
+  const { name, email: inputEmail, phone, whatsappNumber, address, city, state, pincode } = req.body || {};
   const cleanPhone = phone !== undefined ? (phone ? String(phone).replace(/\D/g, '').slice(-10) : null) : undefined;
   const cleanWhatsapp = whatsappNumber !== undefined ? (whatsappNumber ? String(whatsappNumber).replace(/\D/g, '').slice(-10) : null) : undefined;
+  let cleanEmail = undefined;
+  if (inputEmail !== undefined) {
+    if (inputEmail && String(inputEmail).trim()) {
+      cleanEmail = String(inputEmail).trim().toLowerCase();
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+        return res.status(400).json({ error: 'Please enter a valid email address.' });
+      }
+    } else {
+      cleanEmail = null;
+    }
+  }
 
   try {
     if (cleanPhone !== undefined && cleanPhone !== null && cleanPhone.length !== 10) {
@@ -2417,26 +2428,19 @@ app.put('/api/auth/customer/me', authenticateCustomer, async (req, res) => {
     }
 
     const uid = req.user?.uid;
-    const email = (req.user?.email || '').toLowerCase().trim();
+    const authEmail = (req.user?.email || '').toLowerCase().trim() || null;
 
     let existingCustomer = null;
     if (req.customer.id && !req.customer.id.startsWith('fb_')) {
       existingCustomer = await prisma.customer.findUnique({ where: { id: req.customer.id } });
     }
-    if (!existingCustomer && (uid || email)) {
-      existingCustomer = await prisma.customer.findFirst({
-        where: {
-          OR: [
-            ...(uid ? [{ firebaseUid: uid }] : []),
-            ...(email ? [{ email }] : []),
-          ],
-        },
-      });
+    if (!existingCustomer && uid) {
+      existingCustomer = await prisma.customer.findUnique({ where: { firebaseUid: uid } });
     }
 
-    let updated;
     const updateData = {
       ...(name !== undefined && { name: String(name).trim() }),
+      ...(cleanEmail !== undefined && { email: cleanEmail }),
       ...(cleanPhone !== undefined && { phone: cleanPhone }),
       ...(cleanWhatsapp !== undefined && { whatsappNumber: cleanWhatsapp }),
       ...(address !== undefined && { address: address ? String(address).trim() : null }),
@@ -2445,6 +2449,7 @@ app.put('/api/auth/customer/me', authenticateCustomer, async (req, res) => {
       ...(pincode !== undefined && { pincode: pincode ? String(pincode).trim() : null }),
     };
 
+    let updated;
     if (existingCustomer) {
       updated = await prisma.customer.update({
         where: { id: existingCustomer.id },
@@ -2454,7 +2459,7 @@ app.put('/api/auth/customer/me', authenticateCustomer, async (req, res) => {
       updated = await prisma.customer.create({
         data: {
           firebaseUid: uid,
-          email: email || `${uid}@sunbloomadorn.local`,
+          email: cleanEmail || authEmail || null,
           name: name ? String(name).trim() : (req.user?.name || 'Customer'),
           phone: cleanPhone || null,
           whatsappNumber: cleanWhatsapp || null,
@@ -2468,10 +2473,17 @@ app.put('/api/auth/customer/me', authenticateCustomer, async (req, res) => {
 
     res.json({ success: true, customer: updated });
   } catch (err) {
+    if (err?.code === 'P2002' && err?.meta?.target?.includes('email')) {
+      return res.status(409).json({ error: 'This email address is already associated with another customer account.' });
+    }
+    if (err?.code === 'P2002' && err?.meta?.target?.includes('phone')) {
+      return res.status(409).json({ error: 'This mobile number is already associated with another customer account.' });
+    }
     console.warn('[API] PUT /api/auth/customer/me DB warning:', err.message);
     const inMemoryUpdated = {
       ...req.customer,
       ...(name !== undefined && { name: String(name).trim() }),
+      ...(cleanEmail !== undefined && { email: cleanEmail }),
       ...(cleanPhone !== undefined && { phone: cleanPhone }),
       ...(cleanWhatsapp !== undefined && { whatsappNumber: cleanWhatsapp }),
       ...(address !== undefined && { address: address ? String(address).trim() : null }),
@@ -2533,6 +2545,7 @@ app.post('/api/customer/orders', authenticateCustomer, orderLimiter, async (req,
   try {
     const {
       name,
+      email: inputEmail,
       phone,
       whatsappNumber,
       address,
@@ -2558,8 +2571,18 @@ app.post('/api/customer/orders', authenticateCustomer, orderLimiter, async (req,
     const rawWhatsapp = String(whatsappNumber || req.customer.whatsappNumber || rawPhone).trim();
     const cleanWhatsapp = rawWhatsapp.replace(/\D/g, '').slice(-10);
 
+    const resolvedEmail = (inputEmail ? String(inputEmail).trim().toLowerCase() : '') ||
+      (req.customer.email ? String(req.customer.email).trim().toLowerCase() : '') ||
+      (req.user?.email ? String(req.user.email).trim().toLowerCase() : '');
+
     if (!customerName) {
       return res.status(400).json({ error: 'Customer name is required' });
+    }
+    if (!resolvedEmail) {
+      return res.status(400).json({ error: 'A valid email address is required to place an order.' });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(resolvedEmail)) {
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
     }
     if (cleanPhone.length !== 10) {
       return res.status(400).json({ error: 'A valid 10-digit mobile number is required' });
@@ -2667,34 +2690,39 @@ app.post('/api/customer/orders', authenticateCustomer, orderLimiter, async (req,
     const finalTotal = serverSubtotal + resolvedShippingCharge;
     const orderNumber = `ORD-${Date.now()}`;
 
-    // 7. Update customer profile with newest address & contact
+    // 7. Update customer profile with newest address, contact & verified email
     try {
-      await prisma.customer.update({
-        where: { id: req.customer.id },
-        data: {
-          name: customerName,
-          phone: cleanPhone,
-          whatsappNumber: cleanWhatsapp,
-          address: cleanAddress,
-          city: cleanCity,
-          state: cleanState,
-          pincode: cleanPincode,
-        }
-      });
-    } catch (profileErr) {
-      if (profileErr?.code === 'P2002') {
-        // If phone or unique field conflicts with another customer record, update non-unique fields
+      if (req.customer.id && !req.customer.id.startsWith('fb_')) {
         await prisma.customer.update({
           where: { id: req.customer.id },
           data: {
             name: customerName,
+            email: resolvedEmail,
+            phone: cleanPhone,
             whatsappNumber: cleanWhatsapp,
             address: cleanAddress,
             city: cleanCity,
             state: cleanState,
             pincode: cleanPincode,
           }
-        }).catch(() => null);
+        });
+      }
+    } catch (profileErr) {
+      if (profileErr?.code === 'P2002') {
+        // If email or phone unique field conflicts with another customer record, update non-unique fields
+        if (req.customer.id && !req.customer.id.startsWith('fb_')) {
+          await prisma.customer.update({
+            where: { id: req.customer.id },
+            data: {
+              name: customerName,
+              whatsappNumber: cleanWhatsapp,
+              address: cleanAddress,
+              city: cleanCity,
+              state: cleanState,
+              pincode: cleanPincode,
+            }
+          }).catch(() => null);
+        }
       } else {
         console.warn('[Checkout] Customer profile update warning:', profileErr.message);
       }

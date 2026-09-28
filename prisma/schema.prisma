@@ -75,7 +75,7 @@ model Customer {
   id             String         @id @default(cuid())
   firebaseUid    String?        @unique
   name           String
-  email          String         @unique
+  email          String?        @unique
   phone          String?        @unique
   whatsappNumber String?
   address        String?

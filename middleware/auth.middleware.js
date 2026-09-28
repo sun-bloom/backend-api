@@ -57,48 +57,76 @@ const requireCustomer = async (req, res, next) => {
 
   const prisma = req.app.locals.prisma;
   const uid = req.user.uid;
-  const email = (req.user.email || '').toLowerCase().trim();
-  const name = req.user.name || req.user.displayName || (email ? email.split('@')[0] : 'Customer');
+  const email = (req.user.email || '').toLowerCase().trim() || null;
+  const rawPhone = req.user.phone_number || null;
+  const cleanPhone = rawPhone ? String(rawPhone).replace(/\D/g, '').slice(-10) : null;
+  const name = req.user.name || req.user.displayName || (email ? email.split('@')[0] : (cleanPhone ? `Customer ${cleanPhone.slice(-4)}` : 'Customer'));
 
   let customer = null;
 
   try {
-    customer = await prisma.customer.findFirst({
-      where: {
-        OR: [
-          { firebaseUid: uid },
-          ...(email ? [{ email }] : []),
-        ],
-      },
+    // 1. Primary lookup by verified Firebase UID
+    customer = await prisma.customer.findUnique({
+      where: { firebaseUid: uid },
     });
 
     if (customer) {
-      // Link firebaseUid if previously matched by email
-      if (!customer.firebaseUid) {
+      // Auto-populate verified phone from Firebase token if not yet set
+      const updateData = {};
+      if (cleanPhone && !customer.phone) {
+        updateData.phone = cleanPhone;
+      }
+      if (email && !customer.email) {
+        updateData.email = email;
+      }
+      if (name && name !== 'Customer' && (!customer.name || customer.name === 'Customer')) {
+        updateData.name = name;
+      }
+      if (Object.keys(updateData).length > 0) {
         customer = await prisma.customer.update({
           where: { id: customer.id },
-          data: { firebaseUid: uid },
-        });
+          data: updateData,
+        }).catch(() => customer);
       }
     } else {
-      customer = await prisma.customer.create({
-        data: {
-          firebaseUid: uid,
-          name,
-          email: email || `${uid}@sunbloomadorn.local`,
-          phone: req.user.phone_number || null,
-        },
-      }).catch(async () => {
-        // Fallback in case of race condition / unique constraint
-        return await prisma.customer.findFirst({
-          where: {
-            OR: [
-              { firebaseUid: uid },
-              ...(email ? [{ email }] : []),
-            ],
-          },
+      // 2. Safe legacy linking: only match unlinked records (firebaseUid: null)
+      if (email) {
+        const unlinked = await prisma.customer.findFirst({
+          where: { email, firebaseUid: null },
         });
-      });
+        if (unlinked) {
+          customer = await prisma.customer.update({
+            where: { id: unlinked.id },
+            data: { firebaseUid: uid, ...(cleanPhone && !unlinked.phone ? { phone: cleanPhone } : {}) },
+          }).catch(() => null);
+        }
+      }
+      if (!customer && cleanPhone) {
+        const unlinkedPhone = await prisma.customer.findFirst({
+          where: { phone: cleanPhone, firebaseUid: null },
+        });
+        if (unlinkedPhone) {
+          customer = await prisma.customer.update({
+            where: { id: unlinkedPhone.id },
+            data: { firebaseUid: uid, ...(email && !unlinkedPhone.email ? { email } : {}) },
+          }).catch(() => null);
+        }
+      }
+
+      // 3. Create new customer for this verified Firebase identity
+      if (!customer) {
+        customer = await prisma.customer.create({
+          data: {
+            firebaseUid: uid,
+            name,
+            email: email || null,
+            phone: cleanPhone || null,
+          },
+        }).catch(async (createErr) => {
+          console.warn('[Auth Middleware] Customer create fallback:', createErr.message);
+          return await prisma.customer.findUnique({ where: { firebaseUid: uid } });
+        });
+      }
     }
   } catch (err) {
     console.warn('[Auth Middleware] Database sync unavailable for customer, using verified Firebase token session:', err.message);
@@ -108,8 +136,8 @@ const requireCustomer = async (req, res, next) => {
     id: `fb_${uid}`,
     firebaseUid: uid,
     name,
-    email: email || `${uid}@sunbloomadorn.local`,
-    phone: req.user.phone_number || null,
+    email: email || null,
+    phone: cleanPhone || null,
     whatsappNumber: null,
     address: null,
     city: null,
