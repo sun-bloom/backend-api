@@ -831,6 +831,13 @@ const authenticateToken = authenticateFirebaseToken;
 const mediaRoutes = require('./routes/media.routes');
 app.use('/api/admin/media', authenticateAdmin, mediaRoutes);
 
+// ── Hero Banner Slider Routes ────────────────────────────────────────────
+const bannerRoutes = require('./routes/banners.routes');
+// Public customer storefront: GET /api/banners — no auth required
+app.use('/api/banners', bannerRoutes);
+// Admin-only management: GET/POST/PATCH/DELETE /api/admin/banners/* — admin auth required
+app.use('/api/admin/banners', authenticateAdmin, bannerRoutes);
+
 // Customer Query & Support System Routes
 const { customerRouter, adminRouter } = require('./routes/customerQuery.routes');
 app.use('/api/customer/queries', authenticateCustomer, customerRouter);

@@ -290,3 +290,15 @@ model CustomerQueryMessage {
   @@index([queryId])
   @@index([createdAt])
 }
+
+model HeroBanner {
+  id        String   @id @default(cuid())
+  imageUrl  String
+  publicId  String?
+  altText   String?
+  linkUrl   String?
+  sortOrder Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
