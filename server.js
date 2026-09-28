@@ -109,6 +109,10 @@ app.options(/.*/, cors(corsOptions));
 const { router: paymentRoutes } = require('./routes/payments.routes');
 app.use('/api/payments', paymentRoutes);
 
+// ── External SMS OTP Authentication Routes (Custom Token Issuance) ────────
+const otpRoutes = require('./routes/otp.routes');
+app.use('/api/auth/otp', otpRoutes);
+
 const toIsoString = (value) => {
   if (!value) return null;
   const date = value instanceof Date ? value : new Date(value);
