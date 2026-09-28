@@ -1075,6 +1075,7 @@ app.delete('/api/categories/:id', authenticateAdmin, async (req, res) => {
 
 app.get('/api/products', async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     const { categoryId, categorySlug, subcategoryId, subcategorySlug } = req.query;
     const where = { isActive: true };
     if (categoryId) where.categoryId = String(categoryId);
@@ -2920,8 +2921,19 @@ const serializeProduct = (product) => {
   if (!product) return product;
   // Strip internal business productNumber and technical SKU so customer web NEVER receives them
   const { category, subcategory, productNumber, variants, ...rest } = product;
+
+  // Resolve product-level images from variants if product.images is empty
+  const variantImages = (variants || [])
+    .flatMap((v) => (Array.isArray(v.images) ? v.images : []))
+    .filter(Boolean);
+  const resolvedImages = (Array.isArray(rest.images) && rest.images.length > 0)
+    ? rest.images
+    : variantImages;
+
   return {
     ...rest,
+    images: resolvedImages,
+    primaryImage: resolvedImages[0] || null,
     // Preserve the old contract expected by customer-web: `category` is a string.
     // Use category slug when available, otherwise fall back to `categoryId`.
     category: category?.slug || rest.categoryId,
