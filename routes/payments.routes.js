@@ -111,6 +111,19 @@ router.post('/create-order', async (req, res) => {
       });
     }
 
+    // ── Enforce Minimum Order Value (cartTotal >= 200, no maximum limit) ──
+    const MINIMUM_ORDER_VALUE = 200;
+    if (serverSubtotal < MINIMUM_ORDER_VALUE) {
+      const remaining = Number((MINIMUM_ORDER_VALUE - serverSubtotal).toFixed(2));
+      return res.status(400).json({
+        error: 'MINIMUM_ORDER_VALUE_NOT_MET',
+        message: `Add ₹${remaining} more to reach the minimum order value of ₹200.`,
+        minimumOrderValue: MINIMUM_ORDER_VALUE,
+        currentSubtotal: serverSubtotal,
+        amountRemaining: remaining,
+      });
+    }
+
     // ── Step 2: Validate delivery region (pincode-primary) ───────────────
     let deliverySettings = null;
     let matchedRegion = null;

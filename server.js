@@ -1678,6 +1678,17 @@ app.post('/api/orders', orderLimiter, async (req, res) => {
       });
     }
 
+    const MINIMUM_ORDER_VALUE = 200;
+    if (subtotal < MINIMUM_ORDER_VALUE) {
+      const remaining = Number((MINIMUM_ORDER_VALUE - subtotal).toFixed(2));
+      return res.status(400).json({
+        error: `Add ₹${remaining} more to reach the minimum order value of ₹200.`,
+        minimumOrderValue: MINIMUM_ORDER_VALUE,
+        currentSubtotal: subtotal,
+        amountRemaining: remaining,
+      });
+    }
+
     const deliveryCharge = Number(orderData.deliveryCharge) >= 0 ? Number(orderData.deliveryCharge) : 100;
     const totalAmount = subtotal + deliveryCharge;
     const orderNumber = `ORD-${Date.now()}`;
@@ -2633,6 +2644,17 @@ app.post('/api/customer/orders', authenticateCustomer, orderLimiter, async (req,
       return res.status(409).json({
         error: 'Some items in your shopping bag are no longer available in the requested quantity.',
         stockErrors,
+      });
+    }
+
+    const MINIMUM_ORDER_VALUE = 200;
+    if (serverSubtotal < MINIMUM_ORDER_VALUE) {
+      const remaining = Number((MINIMUM_ORDER_VALUE - serverSubtotal).toFixed(2));
+      return res.status(400).json({
+        error: `Add ₹${remaining} more to reach the minimum order value of ₹200.`,
+        minimumOrderValue: MINIMUM_ORDER_VALUE,
+        currentSubtotal: serverSubtotal,
+        amountRemaining: remaining,
       });
     }
 
