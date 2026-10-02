@@ -2825,6 +2825,22 @@ app.post('/api/customer/orders', authenticateCustomer, orderLimiter, async (req,
       }
     }
 
+    // Verify if matchedRegion is an existing record in DeliveryRegion table
+    let validRegionId = null;
+    if (matchedRegion?.id && matchedRegion.id !== 'standard-region' && !matchedRegion.id.startsWith('region-')) {
+      try {
+        const regionExists = await prisma.deliveryRegion.findUnique({
+          where: { id: matchedRegion.id },
+          select: { id: true },
+        });
+        if (regionExists) {
+          validRegionId = regionExists.id;
+        }
+      } catch (e) {
+        console.warn('[Orders] Could not verify deliveryRegion existence:', e.message);
+      }
+    }
+
     // 8. Create Order in DB safely
     const order = await prisma.order.create({
       data: {
@@ -2839,7 +2855,7 @@ app.post('/api/customer/orders', authenticateCustomer, orderLimiter, async (req,
         city: cleanCity,
         state: cleanState,
         pincode: cleanPincode,
-        deliveryRegionId: matchedRegion?.id || null,
+        ...(validRegionId ? { deliveryRegion: { connect: { id: validRegionId } } } : {}),
         whatsappNumber: cleanWhatsapp,
         trackingRequested: Boolean(trackingRequested),
         customerId: req.customer.id,

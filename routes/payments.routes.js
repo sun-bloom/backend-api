@@ -277,6 +277,22 @@ router.post('/create-order', async (req, res) => {
         }
       }
 
+      // Verify if matchedRegion is an existing record in DeliveryRegion table
+      let validRegionId = null;
+      if (matchedRegion?.id && matchedRegion.id !== 'standard-region' && !matchedRegion.id.startsWith('region-')) {
+        try {
+          const regionExists = await prisma.deliveryRegion.findUnique({
+            where: { id: matchedRegion.id },
+            select: { id: true },
+          });
+          if (regionExists) {
+            validRegionId = regionExists.id;
+          }
+        } catch (e) {
+          console.warn('[Payments] Could not verify deliveryRegion existence:', e.message);
+        }
+      }
+
       // Create pending order — MUST succeed before returning PayU payload
       let pendingOrder;
       try {
@@ -290,7 +306,7 @@ router.post('/create-order', async (req, res) => {
             city:              cleanCity,
             state:             cleanState,
             pincode:           cleanPincode,
-            deliveryRegionId:  matchedRegion.id !== 'standard-region' ? matchedRegion.id : null,
+            ...(validRegionId ? { deliveryRegion: { connect: { id: validRegionId } } } : {}),
             paymentMethod:     'gateway',
             paymentStatus:     'PENDING',
             status:            'PENDING',
