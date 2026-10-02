@@ -27,16 +27,20 @@ const authenticateFirebaseToken = async (req, res, next) => {
   } catch (err) {
     try {
       const jwt = require('jsonwebtoken');
-      const JWT_SECRET = process.env.JWT_SECRET || 'sunbloom-adorn-production-secret-key-change-in-env';
-      const decoded = jwt.verify(token, JWT_SECRET);
-      if (decoded && (decoded.uid || decoded.id || decoded.email)) {
-        req.user = {
-          uid: decoded.uid || decoded.id,
-          email: (decoded.email || '').toLowerCase().trim(),
-          name: decoded.name || (decoded.email ? decoded.email.split('@')[0] : 'Admin User'),
-          ...decoded,
-        };
-        return next();
+      const JWT_SECRET = process.env.JWT_SECRET;
+      if (!JWT_SECRET) {
+        console.warn('[Auth Middleware] JWT_SECRET is not configured in environment. Fallback token verification unavailable.');
+      } else {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        if (decoded && (decoded.uid || decoded.id || decoded.email)) {
+          req.user = {
+            uid: decoded.uid || decoded.id,
+            email: (decoded.email || '').toLowerCase().trim(),
+            name: decoded.name || (decoded.email ? decoded.email.split('@')[0] : 'Admin User'),
+            ...decoded,
+          };
+          return next();
+        }
       }
     } catch {
       // Fall through to 401

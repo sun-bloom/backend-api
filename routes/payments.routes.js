@@ -38,7 +38,7 @@ function resolveSiteUrl(req) {
     return `${protocol}://${host}`;
   }
   // Last resort fallback — must be updated if backend URL changes
-  return 'https://sunbloom-api.onrender.com';
+  return 'https://backend-api-bonr.onrender.com';
 }
 
 // ── POST /api/payments/create-order ───────────────────────────────

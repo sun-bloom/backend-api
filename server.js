@@ -9,7 +9,6 @@ const { PrismaClient, Prisma } = require('@prisma/client');
 const { Pool } = require('pg');
 const { PrismaPg } = require('@prisma/adapter-pg');
 require('dotenv').config();
-process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -1546,6 +1545,7 @@ const SAFE_ORDER_SELECT = {
   trackingUrl: true,
   trackingRequested: true,
   whatsappNumber: true,
+  whatsappNotifiedAt: true,
   shippedAt: true,
   deliveredAt: true,
   customerId: true,
@@ -1879,6 +1879,13 @@ app.put('/api/orders/:id', authenticateAdmin, async (req, res) => {
         customer: existingOrder.customer,
       };
       notificationResult = await sendOutForDeliveryNotification(notifyPayload, validatedTrackingUrl);
+      if (notificationResult && notificationResult.sent === true) {
+        updateData.whatsappNotifiedAt = new Date();
+      } else {
+        delete updateData.whatsappNotifiedAt;
+      }
+    } else {
+      delete updateData.whatsappNotifiedAt;
     }
 
     // Whitelist and filter update fields to only valid Order schema fields
@@ -1891,6 +1898,7 @@ app.put('/api/orders/:id', authenticateAdmin, async (req, res) => {
       'trackingUrl',
       'trackingRequested',
       'whatsappNumber',
+      'whatsappNotifiedAt',
       'shippedAt',
       'deliveredAt',
       'deliveryAddress',
@@ -2580,10 +2588,19 @@ app.get('/api/customer/orders/:id', authenticateCustomer, async (req, res) => {
     const lookup = req.params.id;
     const order = await prisma.order.findFirst({
       where: {
-        customerId: req.customer.id,
-        OR: [
-          { id: lookup },
-          { orderNumber: lookup }
+        AND: [
+          {
+            OR: [
+              { id: lookup },
+              { orderNumber: lookup },
+            ],
+          },
+          {
+            OR: [
+              { customerId: req.customer.id },
+              ...(req.customer.email ? [{ customer: { email: req.customer.email } }] : []),
+            ],
+          },
         ],
       },
       select: SAFE_ORDER_SELECT,
@@ -3157,10 +3174,26 @@ app.delete('/api/admin/delivery/regions/:id', authenticateAdmin, async (req, res
   } catch (error) { res.status(400).json({ error: error.message || 'Failed to delete delivery region' }); }
 });
 
+// ── Helper: Resolve safe backend SITE_URL for webhook display ────────
+function resolveSiteUrl(req) {
+  const envUrl = process.env.SITE_URL || '';
+  const isLocalhost = !envUrl || envUrl.includes('localhost') || envUrl.includes('127.0.0.1');
+  if (!isLocalhost) return envUrl.replace(/\/$/, '');
+  const renderUrl = process.env.RENDER_EXTERNAL_URL || '';
+  if (renderUrl) return renderUrl.replace(/\/$/, '');
+  const protocol = req.get('x-forwarded-proto') || req.protocol || 'https';
+  const host = req.get('host') || '';
+  if (host && !host.includes('localhost') && !host.includes('127.0.0.1')) {
+    return `${protocol}://${host}`;
+  }
+  return 'https://backend-api-bonr.onrender.com';
+}
+
 // ── Admin: Payment Gateway Status (PayU Production Gateway) ──
 app.get('/api/admin/payment-gateway-status', authenticateAdmin, async (req, res) => {
   try {
     const isConfigured = Boolean(process.env.PAYU_KEY && process.env.PAYU_SALT);
+    const resolvedSiteUrl = resolveSiteUrl(req);
     res.json({
       gateway:             'PayU',
       environment:         process.env.PAYU_ENV || 'production',
@@ -3169,9 +3202,9 @@ app.get('/api/admin/payment-gateway-status', authenticateAdmin, async (req, res)
       supportedMethods:    ['UPI Intent', 'Dynamic UPI QR', 'Credit/Debit Cards', 'Net Banking'],
       keyIdConfigured:     Boolean(process.env.PAYU_KEY),
       keySecretConfigured: Boolean(process.env.PAYU_SALT),
-      siteUrl:             process.env.SITE_URL || '',
-      frontendUrl:         process.env.FRONTEND_URL || '',
-      webhookUrl:          `${(process.env.SITE_URL || 'http://localhost:3001').replace(/\/$/, '')}/api/payments/payu/webhook`,
+      siteUrl:             process.env.SITE_URL || resolvedSiteUrl,
+      frontendUrl:         process.env.FRONTEND_URL || 'https://sunbloomadorn.com',
+      webhookUrl:          `${resolvedSiteUrl}/api/payments/payu/webhook`,
     });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch payment gateway status', details: error.message });
