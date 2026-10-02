@@ -1,0 +1,74 @@
+# .github/workflows/backend-keepalive.yml
+#
+# PURPOSE:
+#   Prevents Render Free-tier services from sleeping due to inactivity.
+#   Sends a lightweight GET /health ping to each backend every 14 minutes.
+#
+# IMPORTANT:
+#   - All requests are read-only (GET /health).
+#   - No data is written, no orders created, no business logic triggered.
+#   - No secrets or credentials are used.
+#   - Render Free services sleep after ~15 min of inactivity.
+#     Pinging every 14 min keeps them awake during active testing/production use.
+#
+# TO DISABLE:
+#   Delete or rename this file, or comment out the `schedule:` block.
+#
+# BACKENDS TARGETED:
+#   Backend API (primary) : https://backend-api-bonr.onrender.com
+#   Backend API (fallback) : https://sunbloom-api.onrender.com
+#   Both point to the same codebase; both are pinged independently.
+
+name: Backend Keep-Alive Ping
+
+on:
+  schedule:
+    # Every 14 minutes — keeps Render Free services awake before the 15-min idle cutoff.
+    - cron: '*/14 * * * *'
+  # Allow manual trigger from GitHub Actions UI for testing
+  workflow_dispatch:
+
+jobs:
+  ping:
+    name: Ping Backend Health Endpoints
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Ping Backend API (primary) — backend-api-bonr.onrender.com
+        run: |
+          echo "Pinging https://backend-api-bonr.onrender.com/health ..."
+          HTTP_STATUS=$(curl \
+            --silent \
+            --output /dev/null \
+            --write-out "%{http_code}" \
+            --max-time 30 \
+            --retry 1 \
+            --retry-delay 5 \
+            "https://backend-api-bonr.onrender.com/health")
+          echo "HTTP status: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" -ne 200 ]; then
+            echo "ERROR: Backend 1 health check returned HTTP $HTTP_STATUS (expected 200)"
+            exit 1
+          fi
+          echo "OK: Backend 1 is alive."
+
+      - name: Ping Backend API (fallback) — sunbloom-api.onrender.com
+        run: |
+          echo "Pinging https://sunbloom-api.onrender.com/health ..."
+          HTTP_STATUS=$(curl \
+            --silent \
+            --output /dev/null \
+            --write-out "%{http_code}" \
+            --max-time 30 \
+            --retry 1 \
+            --retry-delay 5 \
+            "https://sunbloom-api.onrender.com/health")
+          echo "HTTP status: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" -ne 200 ]; then
+            echo "WARNING: Backend 2 health check returned HTTP $HTTP_STATUS (expected 200)"
+            echo "This may be a different/unused service. Investigate if this keeps failing."
+            # Exit 1 to make the failure visible in GitHub Actions UI
+            exit 1
+          fi
+          echo "OK: Backend 2 is alive."

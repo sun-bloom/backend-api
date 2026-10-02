@@ -3,6 +3,43 @@ const router  = express.Router();
 const { matchDeliveryRegion, calculateShipping } = require('../lib/deliveryMatcher');
 const { generatePaymentHash, generateReverseHash, verifyPayUTransaction, PAYU_KEY, PAYU_PAYMENT_URL } = require('../services/payu/payu.service');
 const { getAuth } = require('../lib/firebase-admin');
+const { ENFORCE_MIN_PAYMENT_LIMIT } = require('../config/testFlags');
+
+// ── Helper: Resolve safe frontend URL (never localhost in redirect) ────────
+// PayU is an external server; it cannot reach localhost.
+// Always use production domain when FRONTEND_URL is missing or localhost.
+function resolveFrontendUrl(req) {
+  const envUrl = process.env.FRONTEND_URL || '';
+  const isLocalhost = !envUrl || envUrl.includes('localhost') || envUrl.includes('127.0.0.1');
+  if (!isLocalhost) return envUrl.replace(/\/$/, '');
+  // Infer from request Origin header if present
+  const origin = req.get('origin') || '';
+  if (origin && !origin.includes('localhost') && !origin.includes('127.0.0.1')) {
+    return origin.replace(/\/$/, '');
+  }
+  // Hard fallback to production domain
+  return 'https://sunbloomadorn.com';
+}
+
+// ── Helper: Resolve safe backend SITE_URL (for surl/furl) ─────────────────
+// surl/furl must be publicly reachable by PayU (not localhost).
+// Production backend is on Render; use RENDER_EXTERNAL_URL if available.
+function resolveSiteUrl(req) {
+  const envUrl = process.env.SITE_URL || '';
+  const isLocalhost = !envUrl || envUrl.includes('localhost') || envUrl.includes('127.0.0.1');
+  if (!isLocalhost) return envUrl.replace(/\/$/, '');
+  // Try RENDER_EXTERNAL_URL (auto-set by Render)
+  const renderUrl = process.env.RENDER_EXTERNAL_URL || '';
+  if (renderUrl) return renderUrl.replace(/\/$/, '');
+  // Infer from request Host header
+  const protocol = req.get('x-forwarded-proto') || req.protocol || 'https';
+  const host = req.get('host') || '';
+  if (host && !host.includes('localhost') && !host.includes('127.0.0.1')) {
+    return `${protocol}://${host}`;
+  }
+  // Last resort fallback — must be updated if backend URL changes
+  return 'https://sunbloom-api.onrender.com';
+}
 
 // ── POST /api/payments/create-order ───────────────────────────────
 router.post('/create-order', async (req, res) => {
@@ -116,8 +153,10 @@ router.post('/create-order', async (req, res) => {
     }
 
     // ── Enforce Minimum Order Value (cartTotal >= 200, no maximum limit) ──
+    // TEMPORARY TESTING: This check is gated by ENFORCE_MIN_PAYMENT_LIMIT in config/testFlags.js.
+    // To re-enable the ₹200 minimum: set ENFORCE_MIN_PAYMENT_LIMIT = true in config/testFlags.js.
     const MINIMUM_ORDER_VALUE = 200;
-    if (serverSubtotal < MINIMUM_ORDER_VALUE) {
+    if (ENFORCE_MIN_PAYMENT_LIMIT && serverSubtotal < MINIMUM_ORDER_VALUE) {
       const remaining = Number((MINIMUM_ORDER_VALUE - serverSubtotal).toFixed(2));
       return res.status(400).json({
         error: 'MINIMUM_ORDER_VALUE_NOT_MET',
@@ -154,35 +193,37 @@ router.post('/create-order', async (req, res) => {
     const orderTotal = serverSubtotal + resolvedShipping;
 
     // ── Step 4: Create pending order in DB ───────────────────────────────
+    // CRITICAL: We MUST create the order in the database BEFORE issuing the PayU payload.
+    // If order creation fails, we MUST abort with an error. Never issue a PayU payload
+    // for a non-existent database order — customer money would be collected with no order.
     const orderNumber = `ORD-${Date.now()}`;
-    let orderId = `ord_${Date.now()}`;
+    let orderId = null;
 
     if (dbAvailable) {
-      try {
-        // Find or create customer
-        // Primary identity: authenticated Firebase UID
-        let existingCustomer = null;
-        if (authUid) {
-          existingCustomer = await prisma.customer.findUnique({
-            where: { firebaseUid: authUid },
-          });
-        }
+      // Find or create customer — Primary identity: authenticated Firebase UID
+      let existingCustomer = null;
+      if (authUid) {
+        existingCustomer = await prisma.customer.findUnique({
+          where: { firebaseUid: authUid },
+        });
+      }
 
-        if (!existingCustomer) {
-          // If not found by firebaseUid, look for an unlinked legacy customer record
-          const candidates = await prisma.customer.findMany({
-            where: {
-              OR: [
-                { phone: cleanPhone },
-                ...(customerEmail ? [{ email: customerEmail }] : []),
-              ],
-            },
-          });
-          // Pick candidate that is either already unlinked or matching
-          existingCustomer = candidates.find((c) => c.firebaseUid === authUid || !c.firebaseUid);
-        }
+      if (!existingCustomer) {
+        // If not found by firebaseUid, look for an unlinked legacy customer record
+        const candidates = await prisma.customer.findMany({
+          where: {
+            OR: [
+              { phone: cleanPhone },
+              ...(customerEmail ? [{ email: customerEmail }] : []),
+            ],
+          },
+        });
+        // Pick candidate that is either already linked to same UID or completely unlinked
+        existingCustomer = candidates.find((c) => c.firebaseUid === authUid || !c.firebaseUid) || null;
+      }
 
-        if (existingCustomer) {
+      if (existingCustomer) {
+        try {
           existingCustomer = await prisma.customer.update({
             where: { id: existingCustomer.id },
             data: {
@@ -197,7 +238,13 @@ router.post('/create-order', async (req, res) => {
               pincode:        cleanPincode,
             },
           });
-        } else {
+        } catch (updateErr) {
+          // If update fails due to unique constraint (phone/email conflict),
+          // keep using the existing customer record as-is.
+          console.warn('[Payments] Customer update warning (using existing):', updateErr.message);
+        }
+      } else {
+        try {
           existingCustomer = await prisma.customer.create({
             data: {
               firebaseUid:    authUid || null,
@@ -211,9 +258,29 @@ router.post('/create-order', async (req, res) => {
               pincode:        cleanPincode,
             },
           });
+        } catch (createErr) {
+          // If create fails (e.g. race condition on phone/email unique), attempt lookup again
+          console.warn('[Payments] Customer create fallback:', createErr.message);
+          if (authUid) {
+            existingCustomer = await prisma.customer.findUnique({ where: { firebaseUid: authUid } });
+          }
+          if (!existingCustomer && customerEmail) {
+            existingCustomer = await prisma.customer.findFirst({ where: { email: customerEmail } });
+          }
+          if (!existingCustomer && cleanPhone) {
+            existingCustomer = await prisma.customer.findFirst({ where: { phone: cleanPhone } });
+          }
+          if (!existingCustomer) {
+            console.error('[Payments] CRITICAL: Cannot resolve customer — aborting order creation');
+            return res.status(500).json({ message: 'Unable to resolve customer account. Please try again.' });
+          }
         }
+      }
 
-        const pendingOrder = await prisma.order.create({
+      // Create pending order — MUST succeed before returning PayU payload
+      let pendingOrder;
+      try {
+        pendingOrder = await prisma.order.create({
           data: {
             orderNumber,
             totalAmount:       orderTotal,
@@ -245,17 +312,28 @@ router.post('/create-order', async (req, res) => {
         orderId = pendingOrder.id;
         console.log('[Payments] Pending order created:', pendingOrder.orderNumber);
       } catch (orderDbErr) {
-        console.warn('[Payments] DB save deferred for order creation:', orderDbErr.message);
+        // CRITICAL: Order creation FAILED — do NOT issue PayU payload
+        console.error('[Payments] CRITICAL: Order DB creation failed:', orderDbErr.message, orderDbErr.code);
+        return res.status(500).json({
+          message: 'Unable to create your order at this time. Please try again. If the problem persists, contact support.',
+          code: orderDbErr.code || 'DB_ERROR',
+        });
       }
+    } else {
+      // DB is unavailable — cannot create order, must not proceed to payment
+      console.error('[Payments] CRITICAL: DB unavailable — cannot create order');
+      return res.status(503).json({
+        message: 'Payment system is temporarily unavailable. Please try again in a few minutes.',
+      });
     }
 
     // ── Step 5: Generate PayU payload ───────────────
     const txnid = orderNumber;
-    
-    // Fallback URL if env is not defined
-    const siteUrl = process.env.SITE_URL || 'http://localhost:3001';
+
+    // Resolve publicly reachable backend URL for surl/furl
+    const siteUrl = resolveSiteUrl(req);
     const customerFirstName = customer.name.trim().split(' ')[0] || 'Customer';
-    
+
     const payuPayload = {
       key: PAYU_KEY,
       txnid: txnid,
@@ -289,59 +367,65 @@ router.post('/create-order', async (req, res) => {
 // ── POST /api/payments/payu/success ─────────────────────────────
 router.post('/payu/success', async (req, res) => {
   const prisma = req.app.locals.prisma;
-  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:4321';
+  const frontendUrl = resolveFrontendUrl(req);
 
   try {
     const payuData = req.body;
     const { txnid, status, hash, amount } = payuData;
 
-    // 1. Locate order
+    if (!txnid) {
+      console.error('[PayU] Success callback missing txnid');
+      return res.redirect(`${frontendUrl}/payment/pending?error=missing_txnid`);
+    }
+
+    // 1. Locate order — txnid = orderNumber = upiTransactionId
     const order = await prisma.order.findFirst({ where: { upiTransactionId: txnid } });
     if (!order) {
       console.error(`[PayU] Order not found for txnid: ${txnid}`);
-      return res.redirect(`${frontendUrl}/payment/pending?order_id=${txnid}&error=not_found`);
+      return res.redirect(`${frontendUrl}/payment/pending?order_id=${encodeURIComponent(txnid)}&error=not_found`);
     }
 
     // 2. Validate amount
     if (parseFloat(amount) !== parseFloat(order.totalAmount.toFixed(2))) {
       console.error(`[PayU] Amount mismatch for txnid: ${txnid}. Expected: ${order.totalAmount}, Got: ${amount}`);
-      return res.redirect(`${frontendUrl}/payment/pending?order_id=${txnid}&error=amount_mismatch`);
+      return res.redirect(`${frontendUrl}/payment/pending?order_id=${encodeURIComponent(txnid)}&error=amount_mismatch`);
     }
 
     // 3. Validate Reverse Hash
     const generatedHash = generateReverseHash(payuData);
     if (generatedHash !== hash) {
       console.error(`[PayU] Hash mismatch for txnid: ${txnid}`);
-      return res.redirect(`${frontendUrl}/payment/pending?order_id=${txnid}&error=hash_mismatch`);
+      return res.redirect(`${frontendUrl}/payment/pending?order_id=${encodeURIComponent(txnid)}&error=hash_mismatch`);
     }
 
     // 4. Validate Status
     if (status !== 'success') {
-      return res.redirect(`${frontendUrl}/payment/pending?order_id=${txnid}`);
+      return res.redirect(`${frontendUrl}/payment/pending?order_id=${encodeURIComponent(txnid)}&error=payment_failed`);
     }
 
     // 5. Server-side Verify Payment
     const verifyData = await verifyPayUTransaction(txnid);
     if (!verifyData || verifyData.status !== 1 || !verifyData.transaction_details || !verifyData.transaction_details[txnid]) {
        console.error(`[PayU] Server verification failed for txnid: ${txnid}`);
-       return res.redirect(`${frontendUrl}/payment/pending?order_id=${txnid}&error=verification_failed`);
+       return res.redirect(`${frontendUrl}/payment/pending?order_id=${encodeURIComponent(txnid)}&error=verification_failed`);
     }
-    
+
     const transactionDetails = verifyData.transaction_details[txnid];
     if (transactionDetails.status !== 'success' && transactionDetails.status !== 'Captured') {
       console.error(`[PayU] Server verification status not success for txnid: ${txnid}`);
-      return res.redirect(`${frontendUrl}/payment/pending?order_id=${txnid}&error=verification_failed`);
+      return res.redirect(`${frontendUrl}/payment/pending?order_id=${encodeURIComponent(txnid)}&error=verification_failed`);
     }
 
     // 6. Idempotent Payment Confirmation & Inventory Decrement
     if (order.paymentStatus !== 'PAID') {
       await prisma.$transaction(async (tx) => {
-        // Mark as paid
+        // Mark as paid and store gateway reference
         await tx.order.update({
           where: { id: order.id },
           data: {
-            paymentStatus: 'PAID',
-            status: 'CONFIRMED'
+            paymentStatus:    'PAID',
+            status:           'CONFIRMED',
+            gatewayReference: payuData.mihpayid || null,
           }
         });
 
@@ -357,19 +441,19 @@ router.post('/payu/success', async (req, res) => {
       console.log(`[PayU] Successfully verified and confirmed order ${order.orderNumber}`);
     }
 
-    // Redirect to success
-    return res.redirect(`${frontendUrl}/payment/pending?order_id=${txnid}`);
+    // Redirect to /payment/success with the order's orderNumber
+    return res.redirect(`${frontendUrl}/payment/success?order_id=${encodeURIComponent(order.orderNumber)}`);
 
   } catch (error) {
     console.error('[PayU] Success callback error:', error);
-    return res.redirect(`${frontendUrl}/payment/pending?error=server_error`);
+    return res.redirect(`${resolveFrontendUrl(req)}/payment/pending?error=server_error`);
   }
 });
 
 // ── POST /api/payments/payu/failure ─────────────────────────────
 router.post('/payu/failure', async (req, res) => {
   const prisma = req.app.locals.prisma;
-  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:4321';
+  const frontendUrl = resolveFrontendUrl(req);
 
   try {
     const payuData = req.body;
@@ -380,19 +464,20 @@ router.post('/payu/failure', async (req, res) => {
         where: { upiTransactionId: txnid, paymentStatus: 'PENDING' },
         data: { paymentStatus: 'FAILED', status: 'CANCELLED' }
       });
+      console.log(`[PayU] Payment failed/cancelled for txnid: ${txnid}`);
     }
 
-    return res.redirect(`${frontendUrl}/payment/pending?order_id=${txnid}`);
+    return res.redirect(`${frontendUrl}/payment/pending?order_id=${txnid ? encodeURIComponent(txnid) : ''}&error=payment_failed`);
   } catch (error) {
     console.error('[PayU] Failure callback error:', error);
-    return res.redirect(`${frontendUrl}/payment/pending?error=server_error`);
+    return res.redirect(`${resolveFrontendUrl(req)}/payment/pending?error=server_error`);
   }
 });
 
 // ── POST /api/payments/payu/webhook ─────────────────────────────
 router.post('/payu/webhook', async (req, res) => {
   const prisma = req.app.locals.prisma;
-  
+
   try {
     const payuData = req.body;
     const { txnid, status, hash, amount } = payuData;
@@ -406,12 +491,16 @@ router.post('/payu/webhook', async (req, res) => {
       const verifyData = await verifyPayUTransaction(txnid);
       if (verifyData && verifyData.status === 1 && verifyData.transaction_details && verifyData.transaction_details[txnid]) {
         const transactionDetails = verifyData.transaction_details[txnid];
-        
+
         if ((transactionDetails.status === 'success' || transactionDetails.status === 'Captured') && order.paymentStatus !== 'PAID') {
            await prisma.$transaction(async (tx) => {
             await tx.order.update({
               where: { id: order.id },
-              data: { paymentStatus: 'PAID', status: 'CONFIRMED' }
+              data: {
+                paymentStatus:    'PAID',
+                status:           'CONFIRMED',
+                gatewayReference: payuData.mihpayid || null,
+              }
             });
 
             const orderItems = await tx.orderItem.findMany({ where: { orderId: order.id } });
@@ -435,6 +524,7 @@ router.post('/payu/webhook', async (req, res) => {
 });
 
 // ── GET /api/payments/status/:orderId ────────────────────────────
+// Supports lookup by: DB cuid id, orderNumber (e.g. ORD-xxx), or upiTransactionId
 router.get('/status/:orderId', async (req, res) => {
   const prisma = req.app.locals.prisma;
 
@@ -442,23 +532,29 @@ router.get('/status/:orderId', async (req, res) => {
     const { orderId } = req.params;
     if (!orderId) return res.status(400).json({ message: 'orderId is required' });
 
-    // First check our DB
-    const order = await prisma.order.findUnique({
-      where: { id: orderId },
-      select: { orderNumber: true, paymentStatus: true, status: true },
+    // Multi-field lookup: id (cuid), orderNumber, or upiTransactionId
+    const order = await prisma.order.findFirst({
+      where: {
+        OR: [
+          { id: orderId },
+          { orderNumber: orderId },
+          { upiTransactionId: orderId },
+        ],
+      },
+      select: { id: true, orderNumber: true, paymentStatus: true, status: true, totalAmount: true },
     });
 
     if (!order) return res.status(404).json({ message: 'Order not found' });
 
     if (order.paymentStatus === 'PAID') {
-      return res.json({ status: 'PAID', orderNumber: order.orderNumber });
+      return res.json({ status: 'PAID', orderNumber: order.orderNumber, totalAmount: order.totalAmount });
     }
 
     if (order.paymentStatus === 'FAILED' || order.status === 'CANCELLED') {
       return res.json({ status: 'FAILED', reason: 'Payment was not completed' });
     }
 
-    return res.json({ status: 'PENDING' });
+    return res.json({ status: 'PENDING', orderNumber: order.orderNumber });
   } catch (err) {
     console.error('[Payments] status check error:', err.message);
     res.status(500).json({ message: 'Failed to check status' });

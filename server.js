@@ -127,6 +127,9 @@ app.use('/api', (req, res, next) => {
 const { router: paymentRoutes } = require('./routes/payments.routes');
 app.use('/api/payments', paymentRoutes);
 
+// ── Test Flags (temporary testing overrides — see config/testFlags.js) ───
+const { ENFORCE_MIN_PAYMENT_LIMIT } = require('./config/testFlags');
+
 const toIsoString = (value) => {
   if (!value) return null;
   const date = value instanceof Date ? value : new Date(value);
@@ -1735,7 +1738,9 @@ app.post('/api/orders', orderLimiter, async (req, res) => {
     }
 
     const MINIMUM_ORDER_VALUE = 200;
-    if (subtotal < MINIMUM_ORDER_VALUE) {
+    // TEMPORARY TESTING: Gated by ENFORCE_MIN_PAYMENT_LIMIT (config/testFlags.js)
+    // To re-enable: set ENFORCE_MIN_PAYMENT_LIMIT = true in config/testFlags.js
+    if (ENFORCE_MIN_PAYMENT_LIMIT && subtotal < MINIMUM_ORDER_VALUE) {
       const remaining = Number((MINIMUM_ORDER_VALUE - subtotal).toFixed(2));
       return res.status(400).json({
         error: `Add ₹${remaining} more to reach the minimum order value of ₹200.`,
@@ -2727,7 +2732,9 @@ app.post('/api/customer/orders', authenticateCustomer, orderLimiter, async (req,
     }
 
     const MINIMUM_ORDER_VALUE = 200;
-    if (serverSubtotal < MINIMUM_ORDER_VALUE) {
+    // TEMPORARY TESTING: Gated by ENFORCE_MIN_PAYMENT_LIMIT (config/testFlags.js)
+    // To re-enable: set ENFORCE_MIN_PAYMENT_LIMIT = true in config/testFlags.js
+    if (ENFORCE_MIN_PAYMENT_LIMIT && serverSubtotal < MINIMUM_ORDER_VALUE) {
       const remaining = Number((MINIMUM_ORDER_VALUE - serverSubtotal).toFixed(2));
       return res.status(400).json({
         error: `Add ₹${remaining} more to reach the minimum order value of ₹200.`,
