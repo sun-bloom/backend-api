@@ -2923,6 +2923,26 @@ app.post('/api/customer/order-consultants', authenticateCustomer, async (req, re
   } catch (error) { res.status(500).json({ error: 'Failed to submit consultant request' }); }
 });
 
+// Customer View: Get their own delivery consultation requests
+app.get('/api/customer/order-consultants', authenticateCustomer, async (req, res) => {
+  try {
+    const enquiries = await prisma.orderConsultantRequest.findMany({
+      where: {
+        OR: [
+          { customerId: req.customer.id },
+          ...(req.customer.email ? [{ email: req.customer.email }] : []),
+          ...(req.customer.phone ? [{ phone: req.customer.phone }] : []),
+        ],
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json({ success: true, enquiries });
+  } catch (error) {
+    console.error('[API] /api/customer/order-consultants error:', error);
+    res.status(500).json({ error: 'Failed to fetch delivery enquiries' });
+  }
+});
+
 app.get('/api/admin/order-consultants/count', authenticateAdmin, async (req, res) => {
   try {
     const count = await prisma.orderConsultantRequest.count({ where: { status: 'NEW' } });
