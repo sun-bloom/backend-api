@@ -34,6 +34,7 @@
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.3.0",
     "node-fetch": "^3.3.2",
+    "nodemailer": "^10.0.13",
     "pg": "^8.23.0",
     "swagger-jsdoc": "^6.2.8",
     "swagger-ui-express": "^5.0.1",

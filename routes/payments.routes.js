@@ -4,6 +4,8 @@ const { matchDeliveryRegion, calculateShipping } = require('../lib/deliveryMatch
 const { generatePaymentHash, generateReverseHash, verifyPayUTransaction, PAYU_KEY, PAYU_PAYMENT_URL } = require('../services/payu/payu.service');
 const { getAuth } = require('../lib/firebase-admin');
 const { ENFORCE_MIN_PAYMENT_LIMIT } = require('../config/testFlags');
+const { sendOrderConfirmationEmail } = require('../services/emailNotification.service');
+const { sendOrderConfirmationWhatsApp } = require('../services/whatsappNotification.service');
 
 // ── Helper: Resolve safe frontend URL (never localhost or PayU in redirect) ──
 // PayU callbacks come with Origin: https://secure.payu.in, so we MUST NEVER redirect to PayU.
@@ -460,6 +462,31 @@ router.post('/payu/success', async (req, res) => {
         }
       });
       console.log(`[PayU] Successfully verified and confirmed order ${order.orderNumber}`);
+
+      // Dispatch Order Confirmation Email & WhatsApp
+      try {
+        const fullOrder = await prisma.order.findUnique({
+          where: { id: order.id },
+          include: {
+            customer: true,
+            items: {
+              include: {
+                variant: {
+                  include: {
+                    product: true,
+                  },
+                },
+              },
+            },
+          },
+        });
+        if (fullOrder) {
+          sendOrderConfirmationEmail(fullOrder).catch((e) => console.error('[PayU Order Email Error]:', e.message));
+          sendOrderConfirmationWhatsApp(fullOrder).catch((e) => console.error('[PayU Order WhatsApp Error]:', e.message));
+        }
+      } catch (notifyErr) {
+        console.warn('[PayU] Notification dispatch error (non-fatal):', notifyErr.message);
+      }
     }
 
     // Redirect to /payment/success with the order's orderNumber

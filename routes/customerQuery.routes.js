@@ -5,6 +5,8 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const { sendSupportQueryReplyEmail } = require('../services/emailNotification.service');
+const { sendSupportQueryReplyWhatsApp } = require('../services/whatsappNotification.service');
 
 const VALID_CATEGORIES = ['Order', 'Payment', 'Delivery', 'Product', 'Return / Refund', 'Other'];
 const VALID_STATUSES = ['OPEN', 'IN_PROGRESS', 'WAITING_FOR_CUSTOMER', 'RESOLVED', 'CLOSED'];
@@ -831,6 +833,7 @@ adminRouter.post('/:id/messages', async (req, res) => {
       try {
         const query = await prisma.customerQuery.findUnique({
           where: { id: queryId },
+          include: { customer: true },
         });
 
         if (query) {
@@ -869,6 +872,19 @@ adminRouter.post('/:id/messages', async (req, res) => {
               updatedAt: new Date(),
             },
           });
+
+          // If not an internal note, dispatch notifications to customer
+          if (!isNote) {
+            const queryRecipient = {
+              name: query.customer?.name || query.name,
+              email: query.customer?.email || query.email,
+              phone: query.customer?.phone || query.customer?.whatsappNumber || query.phone,
+              ticketId: query.queryNumber || query.id,
+              subject: query.subject,
+            };
+            sendSupportQueryReplyEmail(queryRecipient, message.trim()).catch((e) => console.warn('[Query Reply Email Error]:', e.message));
+            sendSupportQueryReplyWhatsApp(queryRecipient, message.trim()).catch((e) => console.warn('[Query Reply WA Error]:', e.message));
+          }
 
           return res.status(201).json({
             success: true,

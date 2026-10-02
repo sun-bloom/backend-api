@@ -37,7 +37,8 @@ const prisma = new PrismaClient({ adapter });
 const app = express();
 const { matchDeliveryRegion, calculateShipping } = require('./lib/deliveryMatcher');
 const { getAllStates, getDistrictsForState, verifyPostalPincode } = require('./lib/indiaPostalService');
-const { isValidTrackingUrl, sendOutForDeliveryNotification } = require('./services/whatsappNotification.service');
+const { isValidTrackingUrl, sendOutForDeliveryNotification, sendDeliveryEnquiryResponseWhatsApp, sendOrderDeliveredWhatsApp } = require('./services/whatsappNotification.service');
+const { sendDeliveryEnquiryResponseEmail, sendOrderStatusEmail } = require('./services/emailNotification.service');
 app.locals.prisma = prisma; // shared with route files
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -1903,6 +1904,7 @@ app.put('/api/orders/:id', authenticateAdmin, async (req, res) => {
         customer: existingOrder.customer,
       };
       notificationResult = await sendOutForDeliveryNotification(notifyPayload, validatedTrackingUrl);
+      sendOrderStatusEmail(existingOrder, 'SHIPPED', validatedTrackingUrl).catch((e) => console.warn('[Order Shipped Email Error]:', e.message));
       if (notificationResult && notificationResult.sent === true) {
         updateData.whatsappNotifiedAt = new Date();
       } else {
@@ -1910,6 +1912,11 @@ app.put('/api/orders/:id', authenticateAdmin, async (req, res) => {
       }
     } else {
       delete updateData.whatsappNotifiedAt;
+    }
+
+    if (newStatus === 'DELIVERED') {
+      sendOrderDeliveredWhatsApp(existingOrder).catch((e) => console.warn('[Order Delivered WA Error]:', e.message));
+      sendOrderStatusEmail(existingOrder, 'DELIVERED').catch((e) => console.warn('[Order Delivered Email Error]:', e.message));
     }
 
     // Whitelist and filter update fields to only valid Order schema fields
@@ -2982,7 +2989,16 @@ app.put('/api/admin/order-consultants/:id', authenticateAdmin, async (req, res) 
   ];
   const status = String(req.body?.status || '').toUpperCase();
   if (!allowed.includes(status)) return res.status(400).json({ error: 'Invalid consultant request status' });
-  const request = await prisma.orderConsultantRequest.update({ where: { id: req.params.id }, data: { status } });
+  const request = await prisma.orderConsultantRequest.update({
+    where: { id: req.params.id },
+    data: { status },
+    include: { customer: true },
+  });
+
+  // Send WhatsApp & Email updates to the customer regarding their delivery enquiry
+  sendDeliveryEnquiryResponseEmail(request).catch((err) => console.warn('[Enquiry Email Error]:', err.message));
+  sendDeliveryEnquiryResponseWhatsApp(request).catch((err) => console.warn('[Enquiry WA Error]:', err.message));
+
   res.json({ request });
 });
 
