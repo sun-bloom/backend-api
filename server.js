@@ -89,12 +89,13 @@ const corsOptions = {
   origin: (origin, callback) => callback(null, isCorsOriginAllowed(origin)),
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin', 'Cache-Control', 'Pragma'],
   optionsSuccessStatus: 204,
 };
 
 // ── Health Endpoint (Render & Uptime Monitoring) ───────────────────────────
 app.get('/health', (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.status(200).json({ ok: true, timestamp: new Date().toISOString() });
 });
 
@@ -104,6 +105,23 @@ app.use(express.urlencoded({ extended: true }));
 
 // ── Preflight CORS ──────────────────────────────────────────────────────────
 app.options(/.*/, cors(corsOptions));
+
+// ── Strict Cache-Control for Admin and Mutation APIs ─────────────────────────
+app.use('/api/admin', (req, res, next) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  next();
+});
+
+app.use('/api', (req, res, next) => {
+  if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.set('Pragma', 'no-cache');
+    res.set('Expires', '0');
+  }
+  next();
+});
 
 // ── Generic Payment Routes (Ready for PayU) ──────────────────────────────
 const { router: paymentRoutes } = require('./routes/payments.routes');
@@ -202,6 +220,19 @@ const serializeCategory = (category) => ({
   image: category.image,
   subcategories: (category.subcategories || []).map(({ id, name, slug, categoryId }) => ({ id, name, slug, categoryId })),
 });
+
+const serializeAdminProduct = (product) => {
+  if (!product) return product;
+  const { category, subcategory, ...rest } = product;
+  return {
+    ...rest,
+    category: category?.slug || rest.categoryId,
+    categoryDetails: category || null,
+    subcategory: subcategory?.slug || rest.subcategoryId || null,
+    subcategoryDetails: subcategory || null,
+    // productNumber is KEPT for admin
+  };
+};
 
 const mapOrderForFrontend = (order, isAdmin = false) => {
   if (!order) return order;
@@ -858,6 +889,7 @@ if (PUBLIC_DOCS) {
 
 app.get('/api/categories', async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     console.log('[API] Fetching categories from database...');
     const categories = await prisma.category.findMany({
       include: { subcategories: { orderBy: { name: 'asc' } } },
@@ -873,6 +905,7 @@ app.get('/api/categories', async (req, res) => {
 
 app.get('/api/subcategories', async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     const { categoryId, categorySlug } = req.query;
     const where = {};
     if (categoryId) where.categoryId = String(categoryId);
@@ -1136,17 +1169,7 @@ app.get('/api/admin/products', authenticateAdmin, async (req, res) => {
     });
 
     // Admin sees full product data INCLUDING productNumber
-    const adminProducts = products.map((product) => {
-      const { category, subcategory, ...rest } = product;
-      return {
-        ...rest,
-        category: category?.slug || rest.categoryId,
-        categoryDetails: category || null,
-        subcategory: subcategory?.slug || rest.subcategoryId || null,
-        subcategoryDetails: subcategory || null,
-        // productNumber is KEPT for admin — not stripped
-      };
-    });
+    const adminProducts = products.map(serializeAdminProduct);
 
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.json({ products: adminProducts });
@@ -1156,10 +1179,31 @@ app.get('/api/admin/products', authenticateAdmin, async (req, res) => {
   }
 });
 
-
+// Admin-only: Returns full product detail including productNumber (NOT stripped)
+app.get('/api/admin/products/:id', authenticateAdmin, async (req, res) => {
+  try {
+    const product = await prisma.product.findUnique({
+      where: { id: req.params.id },
+      include: {
+        category: true,
+        subcategory: true,
+        variants: true,
+      },
+    });
+    if (!product) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.json(serializeAdminProduct(product));
+  } catch (error) {
+    console.error('[API] /api/admin/products/:id error:', error);
+    res.status(500).json({ error: 'Failed to fetch admin product', details: error.message });
+  }
+});
 
 app.get('/api/products/slug/:slug', async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     const product = await prisma.product.findFirst({
       where: { slug: req.params.slug },
       include: {
@@ -1179,6 +1223,7 @@ app.get('/api/products/slug/:slug', async (req, res) => {
 
 app.get('/api/products/:id', async (req, res) => {
   try {
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     const product = await prisma.product.findUnique({
       where: { id: req.params.id },
       include: {
@@ -1254,7 +1299,8 @@ app.post('/api/products', authenticateAdmin, async (req, res) => {
         variants: true
       }
     });
-    res.json(serializeProduct(product));
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.json(serializeAdminProduct(product));
   } catch (error) {
     console.error('Error creating product:', {
       message: error?.message,
@@ -1405,7 +1451,8 @@ app.put('/api/products/:id', authenticateAdmin, async (req, res) => {
         }),
       ]);
 
-      return res.json(serializeProduct(updatedProduct));
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+      return res.json(serializeAdminProduct(updatedProduct));
     }
 
     // If variants are not part of this request, only update product fields.
@@ -1424,7 +1471,8 @@ app.put('/api/products/:id', authenticateAdmin, async (req, res) => {
         variants: true,
       },
     })
-    res.json(serializeProduct(product))
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.json(serializeAdminProduct(product))
   } catch (error) {
     const status = error?.code === 'P2002' || /Product Number|Variant Number|Duplicate Variant/.test(error?.message || '') ? 400 : 500;
     res.status(status).json({ error: error?.message || 'Failed to update product' });
