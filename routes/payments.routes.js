@@ -5,19 +5,21 @@ const { generatePaymentHash, generateReverseHash, verifyPayUTransaction, PAYU_KE
 const { getAuth } = require('../lib/firebase-admin');
 const { ENFORCE_MIN_PAYMENT_LIMIT } = require('../config/testFlags');
 
-// ── Helper: Resolve safe frontend URL (never localhost in redirect) ────────
-// PayU is an external server; it cannot reach localhost.
-// Always use production domain when FRONTEND_URL is missing or localhost.
+// ── Helper: Resolve safe frontend URL (never localhost or PayU in redirect) ──
+// PayU callbacks come with Origin: https://secure.payu.in, so we MUST NEVER redirect to PayU.
+// Always return the storefront domain (https://sunbloomadorn.com).
 function resolveFrontendUrl(req) {
   const envUrl = process.env.FRONTEND_URL || '';
   const isLocalhost = !envUrl || envUrl.includes('localhost') || envUrl.includes('127.0.0.1');
-  if (!isLocalhost) return envUrl.replace(/\/$/, '');
-  // Infer from request Origin header if present
+  if (!isLocalhost && !envUrl.includes('payu')) return envUrl.replace(/\/$/, '');
+
+  // Origin can be PayU's server on callbacks — NEVER redirect back to PayU
   const origin = req.get('origin') || '';
-  if (origin && !origin.includes('localhost') && !origin.includes('127.0.0.1')) {
+  if (origin && !origin.includes('localhost') && !origin.includes('127.0.0.1') && !origin.includes('payu')) {
     return origin.replace(/\/$/, '');
   }
-  // Hard fallback to production domain
+
+  // Hard fallback to production customer storefront
   return 'https://sunbloomadorn.com';
 }
 
