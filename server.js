@@ -6,13 +6,31 @@ const rateLimit = require('express-rate-limit');
 const swaggerJsdoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
 const { PrismaClient, Prisma } = require('@prisma/client');
+const fs = require('fs');
+const path = require('path');
 const { Pool } = require('pg');
 const { PrismaPg } = require('@prisma/adapter-pg');
 require('dotenv').config();
 
+// SSL Configuration for Aiven PostgreSQL using official CA Certificate
+let sslConfig = { rejectUnauthorized: false };
+const caFilePath = path.join(__dirname, 'ca.pem');
+if (process.env.AIVEN_CA_CERT) {
+  sslConfig = { rejectUnauthorized: true, ca: process.env.AIVEN_CA_CERT };
+} else if (fs.existsSync(caFilePath)) {
+  sslConfig = { rejectUnauthorized: true, ca: fs.readFileSync(caFilePath, 'utf-8') };
+}
+
+let dbConnectionString = process.env.DATABASE_URL || '';
+try {
+  const parsedDbUrl = new URL(dbConnectionString);
+  parsedDbUrl.search = '';
+  dbConnectionString = parsedDbUrl.toString();
+} catch (urlErr) {}
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  connectionString: dbConnectionString,
+  ssl: sslConfig,
 });
 const adapter = new PrismaPg(pool);
 const prisma = new PrismaClient({ adapter });
