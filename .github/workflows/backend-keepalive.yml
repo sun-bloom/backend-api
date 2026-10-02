@@ -2,73 +2,64 @@
 #
 # PURPOSE:
 #   Prevents Render Free-tier services from sleeping due to inactivity.
-#   Sends a lightweight GET /health ping to each backend every 14 minutes.
+#   Sends a lightweight GET /health ping to the backend every 14 minutes.
 #
-# IMPORTANT:
+# HEALTH ENDPOINT:
+#   GET /health is a read-only endpoint registered in server.js (before CORS middleware).
+#   Response: { "ok": true, "timestamp": "<ISO datetime>" }
+#   - No authentication required
+#   - No database writes
+#   - No business logic
+#   - No secrets exposed
+#
+# IMPORTANT NOTES:
 #   - All requests are read-only (GET /health).
 #   - No data is written, no orders created, no business logic triggered.
 #   - No secrets or credentials are used.
 #   - Render Free services sleep after ~15 min of inactivity.
 #     Pinging every 14 min keeps them awake during active testing/production use.
-#
-# TO DISABLE:
-#   Delete or rename this file, or comment out the `schedule:` block.
+#   - This does NOT guarantee the service stays awake; it reduces the likelihood
+#     of cold starts during the period this workflow runs.
 #
 # BACKENDS TARGETED:
 #   Backend API (primary) : https://backend-api-bonr.onrender.com
-#   Backend API (fallback) : https://sunbloom-api.onrender.com
-#   Both point to the same codebase; both are pinged independently.
+#   (Only one confirmed active backend. sunbloom-api.onrender.com returns 404 and is NOT pinged.)
+#
+# TO DISABLE:
+#   Delete or rename this file, or remove/comment the `schedule:` block.
 
 name: Backend Keep-Alive Ping
 
 on:
   schedule:
     # Every 14 minutes — keeps Render Free services awake before the 15-min idle cutoff.
+    # GitHub Actions cron uses UTC. Minimum supported schedule is every 5 minutes.
     - cron: '*/14 * * * *'
-  # Allow manual trigger from GitHub Actions UI for testing
+  # Allow manual trigger from GitHub Actions UI for testing without waiting for schedule
   workflow_dispatch:
 
 jobs:
   ping:
-    name: Ping Backend Health Endpoints
+    name: Ping Backend Health Endpoint
     runs-on: ubuntu-latest
+    # Fail the whole job if it takes longer than 5 minutes (Render cold start is usually <60s)
     timeout-minutes: 5
 
     steps:
-      - name: Ping Backend API (primary) — backend-api-bonr.onrender.com
+      - name: Ping Backend API — backend-api-bonr.onrender.com/health
         run: |
-          echo "Pinging https://backend-api-bonr.onrender.com/health ..."
+          echo "Sending keep-alive ping to https://backend-api-bonr.onrender.com/health ..."
           HTTP_STATUS=$(curl \
             --silent \
             --output /dev/null \
             --write-out "%{http_code}" \
-            --max-time 30 \
-            --retry 1 \
-            --retry-delay 5 \
+            --max-time 45 \
             "https://backend-api-bonr.onrender.com/health")
-          echo "HTTP status: $HTTP_STATUS"
-          if [ "$HTTP_STATUS" -ne 200 ]; then
-            echo "ERROR: Backend 1 health check returned HTTP $HTTP_STATUS (expected 200)"
+          echo "HTTP status received: $HTTP_STATUS"
+          if [ "$HTTP_STATUS" -eq 200 ]; then
+            echo "OK: Backend is alive and healthy."
+          else
+            echo "ERROR: Health check returned HTTP $HTTP_STATUS (expected 200)."
+            echo "The Render service may be down or the endpoint may have changed."
             exit 1
           fi
-          echo "OK: Backend 1 is alive."
-
-      - name: Ping Backend API (fallback) — sunbloom-api.onrender.com
-        run: |
-          echo "Pinging https://sunbloom-api.onrender.com/health ..."
-          HTTP_STATUS=$(curl \
-            --silent \
-            --output /dev/null \
-            --write-out "%{http_code}" \
-            --max-time 30 \
-            --retry 1 \
-            --retry-delay 5 \
-            "https://sunbloom-api.onrender.com/health")
-          echo "HTTP status: $HTTP_STATUS"
-          if [ "$HTTP_STATUS" -ne 200 ]; then
-            echo "WARNING: Backend 2 health check returned HTTP $HTTP_STATUS (expected 200)"
-            echo "This may be a different/unused service. Investigate if this keeps failing."
-            # Exit 1 to make the failure visible in GitHub Actions UI
-            exit 1
-          fi
-          echo "OK: Backend 2 is alive."
