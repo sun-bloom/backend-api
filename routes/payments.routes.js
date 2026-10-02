@@ -188,8 +188,11 @@ router.post('/create-order', async (req, res) => {
     }
 
     // ── Step 3: Authoritative shipping calculation ───────────────────────
-    const threshold = Number(deliverySettings?.freeShippingThreshold ?? 1500);
-    const resolvedShipping = serverSubtotal >= threshold ? 0 : (Number(matchedRegion.shippingCharge) || 50);
+    const { shippingCharge: resolvedShipping } = calculateShipping(
+      serverSubtotal,
+      deliverySettings,
+      matchedRegion
+    );
     const orderTotal = serverSubtotal + resolvedShipping;
 
     // ── Step 4: Create pending order in DB ───────────────────────────────
