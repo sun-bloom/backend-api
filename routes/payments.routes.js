@@ -481,11 +481,15 @@ router.post('/payu/failure', async (req, res) => {
     const { txnid } = payuData;
 
     if (txnid) {
-      await prisma.order.updateMany({
+      // If payment failed/cancelled, clean up the pending order so it never creates an unpaid order in the system
+      const order = await prisma.order.findFirst({
         where: { upiTransactionId: txnid, paymentStatus: 'PENDING' },
-        data: { paymentStatus: 'FAILED', status: 'CANCELLED' }
       });
-      console.log(`[PayU] Payment failed/cancelled for txnid: ${txnid}`);
+      if (order) {
+        await prisma.orderItem.deleteMany({ where: { orderId: order.id } });
+        await prisma.order.delete({ where: { id: order.id } });
+        console.log(`[PayU] Cleaned up failed/unpaid order: ${txnid}`);
+      }
     }
 
     return res.redirect(`${frontendUrl}/payment/pending?order_id=${txnid ? encodeURIComponent(txnid) : ''}&error=payment_failed`);

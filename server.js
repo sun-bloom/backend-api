@@ -1584,6 +1584,9 @@ const SAFE_ORDER_SELECT = {
 app.get('/api/orders', authenticateAdmin, async (req, res) => {
   try {
     const orders = await prisma.order.findMany({
+      where: {
+        paymentStatus: { in: ['PAID', 'REFUNDED'] },
+      },
       select: SAFE_ORDER_SELECT,
       orderBy: { createdAt: 'desc' }
     });
@@ -1670,6 +1673,9 @@ app.get('/api/orders/by-phone', trackingLimiter, async (req, res) => {
       where: { phone },
       include: {
         orders: {
+          where: {
+            paymentStatus: { in: ['PAID', 'REFUNDED'] },
+          },
           select: SAFE_ORDER_SELECT,
           orderBy: {
             createdAt: 'desc'
@@ -2590,6 +2596,7 @@ app.get('/api/customer/orders', authenticateCustomer, async (req, res) => {
           { customerId: req.customer.id },
           ...(req.customer.email ? [{ customer: { email: req.customer.email } }] : []),
         ],
+        paymentStatus: { in: ['PAID', 'REFUNDED'] },
       },
       select: SAFE_ORDER_SELECT,
       orderBy: { createdAt: 'desc' },
@@ -2618,6 +2625,9 @@ app.get('/api/customer/orders/:id', authenticateCustomer, async (req, res) => {
               { customerId: req.customer.id },
               ...(req.customer.email ? [{ customer: { email: req.customer.email } }] : []),
             ],
+          },
+          {
+            paymentStatus: { in: ['PAID', 'REFUNDED'] },
           },
         ],
       },
