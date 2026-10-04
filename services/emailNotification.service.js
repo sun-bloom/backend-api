@@ -15,11 +15,17 @@ function getTransporter() {
 
   if (!transporter) {
     transporter = nodemailer.createTransport({
-      service: 'gmail',
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true,
       auth: {
         user,
         pass,
       },
+      tls: {
+        rejectUnauthorized: false,
+      },
+      connectionTimeout: 15000,
     });
   }
   return transporter;
@@ -154,20 +160,31 @@ async function sendOrderConfirmationEmail(order) {
   const items = Array.isArray(order.items) ? order.items : [];
   const total = Number(order.totalAmount || 0).toLocaleString('en-IN');
   const subtotal = Number(order.subtotal || 0).toLocaleString('en-IN');
-  const shipping = Number(order.shippingCharge || 0) === 0 ? 'FREE' : `₹${Number(order.shippingCharge).toLocaleString('en-IN')}`;
+  const shippingCharge = order.deliveryCharge ?? order.shippingCharge ?? 0;
+  const shipping = Number(shippingCharge) === 0 ? 'FREE' : `₹${Number(shippingCharge).toLocaleString('en-IN')}`;
+  const deliveryAddr = order.deliveryAddress || order.shippingAddress || order.customer?.address || '';
+  const city = order.city || order.customer?.city || '';
+  const state = order.state || order.customer?.state || '';
+  const pincode = order.pincode || order.postalCode || order.customer?.pincode || '';
 
-  const itemsHtml = items.map(item => `
+  const itemsHtml = items.map(item => {
+    const name = item.productName || item.variant?.product?.name || item.product?.name || 'Handcrafted Jewellery';
+    const variantTitle = item.variantTitle || item.variant?.title || '';
+    const qty = item.quantity || 1;
+    const price = Number(item.price || item.unitPrice || 0);
+    return `
     <tr>
       <td style="padding: 12px 0; border-bottom: 1px solid #F0E6D8;">
-        <div style="font-weight: 600; color: #2A1C19; font-size: 14px;">${item.productName || item.product?.name || 'Artisan Jewellery'}</div>
-        ${item.variantTitle ? `<div style="font-size: 12px; color: #7D6460;">${item.variantTitle}</div>` : ''}
-        <div style="font-size: 12px; color: #A8928D;">Qty: ${item.quantity}</div>
+        <div style="font-weight: 600; color: #2A1C19; font-size: 14px;">${name}</div>
+        ${variantTitle ? `<div style="font-size: 12px; color: #7D6460;">${variantTitle}</div>` : ''}
+        <div style="font-size: 12px; color: #A8928D;">Qty: ${qty}</div>
       </td>
       <td style="padding: 12px 0; border-bottom: 1px solid #F0E6D8; text-align: right; font-weight: 600; color: #7A223B; font-size: 14px;">
-        ₹${(Number(item.price || 0) * Number(item.quantity || 1)).toLocaleString('en-IN')}
+        ₹${(price * qty).toLocaleString('en-IN')}
       </td>
     </tr>
-  `).join('');
+    `;
+  }).join('');
 
   const bodyContent = `
     <h2 style="color: #7A223B; font-size: 20px; margin-top: 0; font-weight: 600;">Order Confirmed &amp; In Preparation</h2>
@@ -195,11 +212,11 @@ async function sendOrderConfirmationEmail(order) {
       </table>
     </div>
 
-    ${order.shippingAddress ? `
+    ${deliveryAddr ? `
       <div style="margin: 20px 0; font-size: 13px; color: #5C4540; line-height: 1.5;">
-        <strong style="color: #2A1C19;">Delivery Address:</strong><br>
-        ${order.shippingAddress}<br>
-        ${order.city ? `${order.city}, ` : ''}${order.state ? `${order.state} ` : ''}${order.postalCode || ''}
+        <strong style="color: #2A1C19;">Delivery Destination:</strong><br>
+        ${deliveryAddr}<br>
+        ${city ? `${city}, ` : ''}${state ? `${state} ` : ''}${pincode ? `PIN: ${pincode}` : ''}
       </div>
     ` : ''}
 
@@ -419,6 +436,7 @@ async function sendOrderStatusEmail(order, status, trackingUrl) {
 }
 
 module.exports = {
+  getTransporter,
   sendOrderConfirmationEmail,
   sendDeliveryEnquiryResponseEmail,
   sendSupportQueryReplyEmail,

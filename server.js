@@ -3081,6 +3081,74 @@ app.get('/api/products/featured/top-selling', async (req, res) => {
   }
 });
 
+// ── System Health & Notification Diagnostics ──────────────────────────────
+app.get('/api/system/notification-status', async (req, res) => {
+  const emailUser = process.env.EMAIL_USER;
+  const hasPass = Boolean(process.env.EMAIL_PASS);
+  const waToken = Boolean(process.env.WHATSAPP_ACCESS_TOKEN);
+  const waPhoneId = Boolean(process.env.WHATSAPP_PHONE_NUMBER_ID);
+
+  let smtpStatus = 'NOT_CONFIGURED';
+  let smtpError = null;
+
+  if (emailUser && hasPass) {
+    try {
+      const { getTransporter } = require('./services/emailNotification.service');
+      const transporter = getTransporter();
+      if (transporter) {
+        await transporter.verify();
+        smtpStatus = 'VERIFIED_READY';
+      }
+    } catch (err) {
+      smtpStatus = 'VERIFICATION_FAILED';
+      smtpError = err.message;
+    }
+  }
+
+  res.json({
+    emailConfigured: Boolean(emailUser && hasPass),
+    emailUser: emailUser ? `${emailUser.slice(0, 3)}***@${emailUser.split('@')[1] || ''}` : null,
+    hasEmailPass: hasPass,
+    smtpStatus,
+    smtpError,
+    whatsAppConfigured: Boolean(waToken && waPhoneId),
+  });
+});
+
+app.post('/api/system/test-email', async (req, res) => {
+  const { to } = req.body || {};
+  const targetEmail = to || process.env.EMAIL_USER;
+  if (!targetEmail) return res.status(400).json({ error: 'No recipient email specified and EMAIL_USER is not set' });
+
+  const { sendOrderConfirmationEmail } = require('./services/emailNotification.service');
+  const mockOrder = {
+    orderNumber: `TEST-${Date.now().toString().slice(-4)}`,
+    customerName: 'Valued Collector',
+    customerEmail: targetEmail,
+    totalAmount: 1,
+    subtotal: 1,
+    deliveryCharge: 0,
+    deliveryAddress: '15 Apple Garden, Coimbatore',
+    city: 'Coimbatore',
+    state: 'Tamil Nadu',
+    pincode: '641022',
+    items: [
+      {
+        productName: 'Royal Diamond Solitaire Creation',
+        quantity: 1,
+        price: 1,
+      }
+    ]
+  };
+
+  try {
+    const result = await sendOrderConfirmationEmail(mockOrder);
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── Admin Auth Endpoints (Firebase Authenticated + Admin Role Check) ──────
 app.get('/api/auth/admin/me', authenticateAdmin, async (req, res) => {
   res.json({ user: mapAdminUserForFrontend(req.adminUser) });
