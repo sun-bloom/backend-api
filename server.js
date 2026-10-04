@@ -1887,16 +1887,30 @@ app.put('/api/orders/:id', authenticateAdmin, async (req, res) => {
       updateData.deliveredAt = new Date();
     }
 
-    // WhatsApp Notification Trigger with De-duplication
+    // ─── Email Notifications (always fire on status change, no tracking URL required) ───
+    if (newStatus === 'SHIPPED') {
+      sendOrderStatusEmail(existingOrder, 'SHIPPED', validatedTrackingUrl || null)
+        .catch((e) => console.warn('[Order Shipped Email Error]:', e.message));
+    }
+    if (newStatus === 'OUT_FOR_DELIVERY') {
+      sendOrderStatusEmail(existingOrder, 'OUT_FOR_DELIVERY', validatedTrackingUrl || null)
+        .catch((e) => console.warn('[Order OFD Email Error]:', e.message));
+    }
+    if (newStatus === 'DELIVERED') {
+      sendOrderStatusEmail(existingOrder, 'DELIVERED')
+        .catch((e) => console.warn('[Order Delivered Email Error]:', e.message));
+    }
+
+    // ─── WhatsApp Notification (only when tracking URL is provided) ───
     let notificationResult = null;
-    const isOutForDelivery = newStatus === 'SHIPPED';
+    const isShipped = newStatus === 'SHIPPED';
     const hasValidTracking = Boolean(validatedTrackingUrl && isValidTrackingUrl(validatedTrackingUrl));
-    const shouldAttemptNotification =
-      isOutForDelivery &&
+    const shouldAttemptWhatsApp =
+      isShipped &&
       hasValidTracking &&
       (!existingOrder.whatsappNotifiedAt || (trackingUrlProvided && validatedTrackingUrl !== existingOrder.trackingUrl));
 
-    if (shouldAttemptNotification) {
+    if (shouldAttemptWhatsApp) {
       const notifyPayload = {
         orderNumber: existingOrder.orderNumber,
         customerName: existingOrder.customer?.name || '',
@@ -1904,7 +1918,6 @@ app.put('/api/orders/:id', authenticateAdmin, async (req, res) => {
         customer: existingOrder.customer,
       };
       notificationResult = await sendOutForDeliveryNotification(notifyPayload, validatedTrackingUrl);
-      sendOrderStatusEmail(existingOrder, 'SHIPPED', validatedTrackingUrl).catch((e) => console.warn('[Order Shipped Email Error]:', e.message));
       if (notificationResult && notificationResult.sent === true) {
         updateData.whatsappNotifiedAt = new Date();
       } else {
@@ -1916,7 +1929,6 @@ app.put('/api/orders/:id', authenticateAdmin, async (req, res) => {
 
     if (newStatus === 'DELIVERED') {
       sendOrderDeliveredWhatsApp(existingOrder).catch((e) => console.warn('[Order Delivered WA Error]:', e.message));
-      sendOrderStatusEmail(existingOrder, 'DELIVERED').catch((e) => console.warn('[Order Delivered Email Error]:', e.message));
     }
 
     // Whitelist and filter update fields to only valid Order schema fields
