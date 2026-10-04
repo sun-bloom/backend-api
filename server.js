@@ -3007,9 +3007,12 @@ app.put('/api/admin/order-consultants/:id', authenticateAdmin, async (req, res) 
     include: { customer: true },
   });
 
-  // Send WhatsApp & Email updates to the customer regarding their delivery enquiry
-  sendDeliveryEnquiryResponseEmail(request).catch((err) => console.warn('[Enquiry Email Error]:', err.message));
-  sendDeliveryEnquiryResponseWhatsApp(request).catch((err) => console.warn('[Enquiry WA Error]:', err.message));
+  // Send WhatsApp & Email only when admin gives a delivery verdict (available/unavailable)
+  const isDeliveryVerdict = ['DELIVERY_AVAILABLE', 'DELIVERY_UNAVAILABLE'].includes(status);
+  if (isDeliveryVerdict) {
+    sendDeliveryEnquiryResponseEmail(request).catch((err) => console.warn('[Enquiry Email Error]:', err.message));
+    sendDeliveryEnquiryResponseWhatsApp(request).catch((err) => console.warn('[Enquiry WA Error]:', err.message));
+  }
 
   res.json({ request });
 });
