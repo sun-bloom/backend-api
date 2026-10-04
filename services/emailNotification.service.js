@@ -18,6 +18,12 @@ function getTransporter() {
       host: 'smtp.gmail.com',
       port: 465,
       secure: true,
+      // ✅ Pool: reuse connection instead of new TLS handshake per email
+      pool: true,
+      maxConnections: 3,
+      maxMessages: 100,
+      rateDelta: 1000,  // measure rate per 1 second
+      rateLimit: 5,     // max 5 emails per second
       auth: {
         user,
         pass,
@@ -25,11 +31,33 @@ function getTransporter() {
       tls: {
         rejectUnauthorized: false,
       },
-      connectionTimeout: 15000,
+      connectionTimeout: 10000,
+      socketTimeout: 15000,
+    });
+
+    // Warm up the pool connection immediately so first email is fast
+    transporter.verify((err) => {
+      if (err) {
+        console.warn('[Email] SMTP pool verify warning:', err.message);
+      } else {
+        console.log('[Email] ✅ SMTP pool ready — connection warm');
+      }
     });
   }
   return transporter;
 }
+
+/**
+ * Fire-and-forget email helper — call this from API routes so the
+ * HTTP response is NOT delayed by email sending.
+ * Usage: sendEmailAsync(() => sendOrderConfirmationEmail(order))
+ */
+function sendEmailAsync(emailFn) {
+  Promise.resolve()
+    .then(() => emailFn())
+    .catch((err) => console.error('[Email] Background send error:', err.message));
+}
+
 
 const BRAND_NAME = 'Sunbloom Adorn';
 const SITE_URL = process.env.SITE_URL || process.env.FRONTEND_URL || 'https://sunbloomadorn.com';
@@ -437,8 +465,10 @@ async function sendOrderStatusEmail(order, status, trackingUrl) {
 
 module.exports = {
   getTransporter,
+  sendEmailAsync,
   sendOrderConfirmationEmail,
   sendDeliveryEnquiryResponseEmail,
   sendSupportQueryReplyEmail,
   sendOrderStatusEmail,
 };
+
