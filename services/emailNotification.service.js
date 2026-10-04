@@ -16,23 +16,25 @@ function getTransporter() {
   if (!transporter) {
     transporter = nodemailer.createTransport({
       host: 'smtp.gmail.com',
-      port: 465,
-      secure: true,
+      port: 587,           // ✅ Port 587 (STARTTLS) — works on Render (IPv4 compatible)
+      secure: false,       // false = STARTTLS upgrade after connect
       // ✅ Pool: reuse connection instead of new TLS handshake per email
       pool: true,
       maxConnections: 3,
       maxMessages: 100,
-      rateDelta: 1000,  // measure rate per 1 second
-      rateLimit: 5,     // max 5 emails per second
+      rateDelta: 1000,
+      rateLimit: 5,
       auth: {
         user,
         pass,
       },
       tls: {
         rejectUnauthorized: false,
+        ciphers: 'SSLv3',
       },
-      connectionTimeout: 10000,
-      socketTimeout: 15000,
+      connectionTimeout: 15000,
+      socketTimeout: 20000,
+      greetingTimeout: 10000,
     });
 
     // Warm up the pool connection immediately so first email is fast
@@ -40,10 +42,11 @@ function getTransporter() {
       if (err) {
         console.warn('[Email] SMTP pool verify warning:', err.message);
       } else {
-        console.log('[Email] ✅ SMTP pool ready — connection warm');
+        console.log('[Email] ✅ SMTP pool ready — connection warm (port 587)');
       }
     });
   }
+
   return transporter;
 }
 
