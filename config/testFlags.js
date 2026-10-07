@@ -38,7 +38,7 @@
 const ENFORCE_MIN_PAYMENT_LIMIT =
   process.env.ENFORCE_MIN_PAYMENT_LIMIT !== undefined
     ? process.env.ENFORCE_MIN_PAYMENT_LIMIT === 'true'
-    : false; // ← SET TO true TO RE-ENABLE ₹200 MINIMUM
+    : true;
 
 module.exports = {
   ENFORCE_MIN_PAYMENT_LIMIT,

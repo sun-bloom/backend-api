@@ -4,6 +4,18 @@
 const nodemailer = require('nodemailer');
 
 let transporter = null;
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function isValidEmailAddress(value) {
+  return typeof value === 'string' && EMAIL_PATTERN.test(value.trim());
+}
+
+function logEmailFailure(type, recipient, reason, orderNumber) {
+  const safeRecipient = isValidEmailAddress(recipient) ? recipient.trim().toLowerCase() : 'none';
+  const safeReason = String(reason || 'unknown error').replace(/[\r\n]+/g, ' ').slice(0, 300);
+  const orderPart = orderNumber ? ` orderNumber=${String(orderNumber)}` : '';
+  console.error(`EMAIL_SEND_FAILED type=${type}${orderPart} recipient=${safeRecipient} reason=${safeReason}`);
+}
 
 function getTransporter() {
   const user = process.env.EMAIL_USER;
@@ -29,8 +41,7 @@ function getTransporter() {
         pass,
       },
       tls: {
-        rejectUnauthorized: false,
-        ciphers: 'SSLv3',
+        rejectUnauthorized: true,
       },
       connectionTimeout: 15000,
       socketTimeout: 20000,
@@ -58,7 +69,13 @@ function getTransporter() {
 function sendEmailAsync(emailFn) {
   Promise.resolve()
     .then(() => emailFn())
-    .catch((err) => console.error('[Email] Background send error:', err.message));
+    .then((result) => {
+      if (result && result.success === false) {
+        logEmailFailure(result.type || 'background', result.recipient, result.reason || result.error);
+      }
+      return result;
+    })
+    .catch((err) => logEmailFailure('background', null, err?.message));
 }
 
 
@@ -180,10 +197,15 @@ function wrapEmailTemplate(title, preheader, bodyContent) {
  */
 async function sendOrderConfirmationEmail(order) {
   const t = getTransporter();
-  const customerEmail = order.customerEmail || order.customer?.email;
-  if (!t || !customerEmail) {
-    if (!t) console.log('[Email] EMAIL_USER/EMAIL_PASS not configured. Skipping order confirmation email.');
-    return { success: false, reason: 'NOT_CONFIGURED_OR_NO_EMAIL' };
+  const customerEmail = String(order.customerEmail || order.customer?.email || '').trim().toLowerCase();
+  if (!t || !isValidEmailAddress(customerEmail)) {
+    logEmailFailure(
+      'order_confirmation',
+      customerEmail,
+      !t ? 'EMAIL_PROVIDER_NOT_CONFIGURED' : 'INVALID_OR_MISSING_RECIPIENT',
+      order.orderNumber
+    );
+    return { success: false, reason: !t ? 'EMAIL_PROVIDER_NOT_CONFIGURED' : 'INVALID_OR_MISSING_RECIPIENT' };
   }
 
   const customerName = order.customerName || order.customer?.name || 'Valued Collector';
@@ -252,7 +274,7 @@ async function sendOrderConfirmationEmail(order) {
     ` : ''}
 
     <div style="text-align: center; margin-top: 30px;">
-      <a href="${SITE_URL}/order-history" class="btn">View Order Details</a>
+      <a href="${SITE_URL}/orders" class="btn">View Order Details</a>
     </div>
   `;
 
@@ -270,10 +292,10 @@ async function sendOrderConfirmationEmail(order) {
       html,
     });
     console.log(`[Email Notification] Order confirmation sent to ${customerEmail} (MessageId: ${info.messageId})`);
-    return { success: true, messageId: info.messageId };
+    return { success: true, messageId: info.messageId, type: 'order_confirmation', recipient: customerEmail };
   } catch (error) {
-    console.error(`[Email Notification] Failed to send order confirmation to ${customerEmail}:`, error.message);
-    return { success: false, error: error.message };
+    logEmailFailure('order_confirmation', customerEmail, error.message, order.orderNumber);
+    return { success: false, error: error.message, type: 'order_confirmation', recipient: customerEmail };
   }
 }
 
@@ -403,8 +425,16 @@ async function sendSupportQueryReplyEmail(query, replyMessage) {
  */
 async function sendOrderStatusEmail(order, status, trackingUrl) {
   const t = getTransporter();
-  const customerEmail = order.customerEmail || order.customer?.email;
-  if (!t || !customerEmail) return { success: false, reason: 'NO_EMAIL' };
+  const customerEmail = String(order.customerEmail || order.customer?.email || '').trim().toLowerCase();
+  if (!t || !isValidEmailAddress(customerEmail)) {
+    logEmailFailure(
+      `order_status_${String(status || '').toLowerCase()}`,
+      customerEmail,
+      !t ? 'EMAIL_PROVIDER_NOT_CONFIGURED' : 'INVALID_OR_MISSING_RECIPIENT',
+      order.orderNumber
+    );
+    return { success: false, reason: !t ? 'EMAIL_PROVIDER_NOT_CONFIGURED' : 'INVALID_OR_MISSING_RECIPIENT' };
+  }
 
   const customerName = order.customerName || order.customer?.name || 'Valued Collector';
   const orderNumber = order.orderNumber;
@@ -412,7 +442,7 @@ async function sendOrderStatusEmail(order, status, trackingUrl) {
   let title = '';
   let statusText = '';
   let ctaText = 'Track Your Shipment';
-  let ctaUrl = trackingUrl || `${SITE_URL}/order-history`;
+  let ctaUrl = trackingUrl || `${SITE_URL}/orders`;
 
   if (status === 'OUT_FOR_DELIVERY') {
     title = '🚚 Your Order is Out for Delivery!';
@@ -459,11 +489,76 @@ async function sendOrderStatusEmail(order, status, trackingUrl) {
       subject: `${title} (#${orderNumber}) — Sunbloom Adorn`,
       html,
     });
-    return { success: true, messageId: info.messageId };
+    return { success: true, messageId: info.messageId, type: `order_status_${String(status || '').toLowerCase()}`, recipient: customerEmail };
   } catch (error) {
-    console.error(`[Email Notification] Failed to send order status email:`, error.message);
-    return { success: false, error: error.message };
+    logEmailFailure(`order_status_${String(status || '').toLowerCase()}`, customerEmail, error.message, order.orderNumber);
+    return { success: false, error: error.message, type: `order_status_${String(status || '').toLowerCase()}`, recipient: customerEmail };
   }
+}
+
+/**
+ * Send a new-product announcement to one existing customer.
+ * The caller is responsible for selecting existing customers and invoking this
+ * only after a successful Product.create operation.
+ */
+async function sendNewProductAnnouncementEmail(product, customer) {
+  const t = getTransporter();
+  const customerEmail = String(customer?.email || '').trim().toLowerCase();
+  if (!t || !isValidEmailAddress(customerEmail)) {
+    logEmailFailure(
+      'new_product',
+      customerEmail,
+      !t ? 'EMAIL_PROVIDER_NOT_CONFIGURED' : 'INVALID_OR_MISSING_RECIPIENT'
+    );
+    return { success: false, reason: !t ? 'EMAIL_PROVIDER_NOT_CONFIGURED' : 'INVALID_OR_MISSING_RECIPIENT' };
+  }
+
+  const productName = product.name || 'New Jewellery Creation';
+  const productUrl = `${SITE_URL}/products/${encodeURIComponent(product.slug || product.id)}`;
+  const imageUrl = Array.isArray(product.images) && /^https?:\/\//i.test(product.images[0] || '')
+    ? product.images[0]
+    : null;
+  const imageHtml = imageUrl
+    ? `<img src="${imageUrl}" alt="${productName}" style="display:block;width:100%;max-width:260px;height:auto;border-radius:12px;margin:0 auto 20px;" />`
+    : '';
+  const bodyContent = `
+    <h2 style="color: #7A223B; font-size: 20px; margin-top: 0; font-weight: 600;">New jewellery has arrived at Sunbloom Adorn.</h2>
+    <p style="font-size: 14px; line-height: 1.6; color: #5C4540;">Dear ${customer.name || 'Valued Collector'},<br><br>
+      We are delighted to introduce a new addition to our collection.</p>
+    ${imageHtml}
+    <div style="background-color: #FAF6F0; border-radius: 12px; padding: 20px; margin: 20px 0; border: 1px solid #E8DCCF;">
+      <h3 style="margin: 0 0 8px; font-size: 17px; color: #2A1C19;">${productName}</h3>
+      ${product.description ? `<p style="margin: 0 0 10px; font-size: 13px; line-height: 1.5; color: #7D6460;">${product.description}</p>` : ''}
+      ${Number.isFinite(Number(product.basePrice)) ? `<p style="margin: 0; font-size: 15px; font-weight: 700; color: #7A223B;">₹${Number(product.basePrice).toLocaleString('en-IN')}</p>` : ''}
+    </div>
+    <div style="text-align: center; margin-top: 24px;"><a href="${productUrl}" class="btn">View the New Collection Piece</a></div>
+  `;
+  const html = wrapEmailTemplate(
+    `New Arrival: ${productName} | Sunbloom Adorn`,
+    `Discover the latest jewellery addition from Sunbloom Adorn: ${productName}.`,
+    bodyContent
+  );
+
+  try {
+    const info = await t.sendMail({
+      from: `"Sunbloom Adorn Concierge" <${process.env.EMAIL_USER}>`,
+      to: customerEmail,
+      subject: `New Jewellery Has Arrived: ${productName} — Sunbloom Adorn`,
+      html,
+    });
+    return { success: true, messageId: info.messageId, type: 'new_product', recipient: customerEmail };
+  } catch (error) {
+    logEmailFailure('new_product', customerEmail, error.message);
+    return { success: false, error: error.message, type: 'new_product', recipient: customerEmail };
+  }
+}
+
+async function sendNewProductAnnouncementEmails(product, customers) {
+  const results = [];
+  for (const customer of customers || []) {
+    results.push(await sendNewProductAnnouncementEmail(product, customer));
+  }
+  return results;
 }
 
 module.exports = {
@@ -473,5 +568,8 @@ module.exports = {
   sendDeliveryEnquiryResponseEmail,
   sendSupportQueryReplyEmail,
   sendOrderStatusEmail,
+  sendNewProductAnnouncementEmail,
+  sendNewProductAnnouncementEmails,
+  isValidEmailAddress,
 };
 

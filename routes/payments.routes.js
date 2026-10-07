@@ -45,6 +45,53 @@ function resolveSiteUrl(req) {
   return 'https://backend-api-bonr.onrender.com';
 }
 
+async function confirmVerifiedPayment(prisma, order, payuData) {
+  return prisma.$transaction(async (tx) => {
+    const updated = await tx.order.updateMany({
+      where: {
+        id: order.id,
+        paymentStatus: { not: 'PAID' },
+      },
+      data: {
+        paymentStatus: 'PAID',
+        status: 'CONFIRMED',
+        gatewayReference: payuData.mihpayid || null,
+      },
+    });
+
+    if (updated.count !== 1) return false;
+
+    const orderItems = await tx.orderItem.findMany({ where: { orderId: order.id } });
+    for (const item of orderItems) {
+      await tx.variant.update({
+        where: { id: item.variantId },
+        data: { stock: { decrement: item.quantity } },
+      });
+    }
+
+    return true;
+  });
+}
+
+async function sendConfirmedOrderEmail(prisma, orderId) {
+  const fullOrder = await prisma.order.findUnique({
+    where: { id: orderId },
+    include: {
+      customer: true,
+      items: {
+        include: {
+          variant: {
+            include: { product: true },
+          },
+        },
+      },
+    },
+  });
+
+  if (!fullOrder) return { success: false, reason: 'ORDER_NOT_FOUND' };
+  return sendOrderConfirmationEmail(fullOrder);
+}
+
 // ── POST /api/payments/create-order ───────────────────────────────
 router.post('/create-order', async (req, res) => {
   const prisma = req.app.locals.prisma;
@@ -440,50 +487,21 @@ router.post('/payu/success', async (req, res) => {
     }
 
     // 6. Idempotent Payment Confirmation & Inventory Decrement
-    if (order.paymentStatus !== 'PAID') {
-      await prisma.$transaction(async (tx) => {
-        // Mark as paid and store gateway reference
-        await tx.order.update({
-          where: { id: order.id },
-          data: {
-            paymentStatus:    'PAID',
-            status:           'CONFIRMED',
-            gatewayReference: payuData.mihpayid || null,
-          }
-        });
-
-        // Decrement inventory
-        const orderItems = await tx.orderItem.findMany({ where: { orderId: order.id } });
-        for (const item of orderItems) {
-          await tx.variant.update({
-            where: { id: item.variantId },
-            data: { stock: { decrement: item.quantity } }
-          });
-        }
-      });
+    const newlyConfirmed = await confirmVerifiedPayment(prisma, order, payuData);
+    if (newlyConfirmed) {
       console.log(`[PayU] Successfully verified and confirmed order ${order.orderNumber}`);
 
       // Dispatch Order Confirmation Email & WhatsApp
       try {
+        const emailResult = await sendConfirmedOrderEmail(prisma, order.id);
+        if (!emailResult.success) {
+          console.error(`[PayU] Order confirmation email was not sent for ${order.orderNumber}: ${emailResult.reason || emailResult.error || 'unknown reason'}`);
+        }
         const fullOrder = await prisma.order.findUnique({
           where: { id: order.id },
-          include: {
-            customer: true,
-            items: {
-              include: {
-                variant: {
-                  include: {
-                    product: true,
-                  },
-                },
-              },
-            },
-          },
+          include: { customer: true, items: { include: { variant: { include: { product: true } } } } },
         });
-        if (fullOrder) {
-          sendOrderConfirmationEmail(fullOrder).catch((e) => console.error('[PayU Order Email Error]:', e.message));
-          sendOrderConfirmationWhatsApp(fullOrder).catch((e) => console.error('[PayU Order WhatsApp Error]:', e.message));
-        }
+        if (fullOrder) sendOrderConfirmationWhatsApp(fullOrder).catch((e) => console.error('[PayU Order WhatsApp Error]:', e.message));
       } catch (notifyErr) {
         console.warn('[PayU] Notification dispatch error (non-fatal):', notifyErr.message);
       }
@@ -544,25 +562,18 @@ router.post('/payu/webhook', async (req, res) => {
       if (verifyData && verifyData.status === 1 && verifyData.transaction_details && verifyData.transaction_details[txnid]) {
         const transactionDetails = verifyData.transaction_details[txnid];
 
-        if ((transactionDetails.status === 'success' || transactionDetails.status === 'Captured') && order.paymentStatus !== 'PAID') {
-           await prisma.$transaction(async (tx) => {
-            await tx.order.update({
-              where: { id: order.id },
-              data: {
-                paymentStatus:    'PAID',
-                status:           'CONFIRMED',
-                gatewayReference: payuData.mihpayid || null,
+        if (transactionDetails.status === 'success' || transactionDetails.status === 'Captured') {
+          const newlyConfirmed = await confirmVerifiedPayment(prisma, order, payuData);
+          if (newlyConfirmed) {
+            try {
+              const emailResult = await sendConfirmedOrderEmail(prisma, order.id);
+              if (!emailResult.success) {
+                console.error(`[PayU] Webhook order confirmation email was not sent for ${order.orderNumber}: ${emailResult.reason || emailResult.error || 'unknown reason'}`);
               }
-            });
-
-            const orderItems = await tx.orderItem.findMany({ where: { orderId: order.id } });
-            for (const item of orderItems) {
-              await tx.variant.update({
-                where: { id: item.variantId },
-                data: { stock: { decrement: item.quantity } }
-              });
+            } catch (notifyErr) {
+              console.warn('[PayU] Webhook notification dispatch error (non-fatal):', notifyErr.message);
             }
-          });
+          }
           console.log(`[PayU] Webhook confirmed order ${order.orderNumber}`);
         }
       }

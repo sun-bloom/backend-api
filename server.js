@@ -38,12 +38,31 @@ const app = express();
 const { matchDeliveryRegion, calculateShipping } = require('./lib/deliveryMatcher');
 const { getAllStates, getDistrictsForState, verifyPostalPincode } = require('./lib/indiaPostalService');
 const { isValidTrackingUrl, sendOutForDeliveryNotification, sendDeliveryEnquiryResponseWhatsApp, sendOrderDeliveredWhatsApp } = require('./services/whatsappNotification.service');
-const { sendDeliveryEnquiryResponseEmail, sendOrderStatusEmail } = require('./services/emailNotification.service');
+const {
+  sendDeliveryEnquiryResponseEmail,
+  sendOrderStatusEmail,
+  sendNewProductAnnouncementEmails,
+  isValidEmailAddress,
+} = require('./services/emailNotification.service');
 app.locals.prisma = prisma; // shared with route files
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
 const AUTH_DEBUG = process.env.DEBUG_AUTH === '1';
 const PUBLIC_DOCS = process.env.PUBLIC_DOCS === '1';
+
+async function notifyCustomersOfNewProduct(product) {
+  const customers = await prisma.customer.findMany({
+    where: { email: { not: null } },
+    select: { name: true, email: true },
+  });
+  const validCustomers = customers.filter((customer) => isValidEmailAddress(customer.email));
+  if (validCustomers.length === 0) return { attempted: 0, failed: 0 };
+
+  const results = await sendNewProductAnnouncementEmails(product, validCustomers);
+  const failed = results.filter((result) => !result.success).length;
+  console.log(`[Email] New product notification complete productId=${product.id} attempted=${results.length} failed=${failed}`);
+  return { attempted: results.length, failed };
+}
 
 if (!JWT_SECRET) {
   console.error('ERROR: JWT_SECRET environment variable is required');
@@ -1320,6 +1339,9 @@ app.post('/api/products', authenticateAdmin, async (req, res) => {
         variants: true
       }
     });
+    notifyCustomersOfNewProduct(product).catch((error) => {
+      console.error(`EMAIL_SEND_FAILED type=new_product productId=${product.id} reason=${String(error.message || error).replace(/[\r\n]+/g, ' ').slice(0, 300)}`);
+    });
     res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.json(serializeAdminProduct(product));
   } catch (error) {
@@ -1862,6 +1884,10 @@ app.put('/api/orders/:id', authenticateAdmin, async (req, res) => {
       }
     }
 
+    const requestedStatus = updateData.orderStatus || updateData.status;
+    const requestedStatusNormalized = requestedStatus
+      ? String(requestedStatus).toUpperCase().replace(/\s+/g, '_')
+      : null;
     let newStatus = existingOrder.status;
     if (updateData.orderStatus) {
       newStatus = String(updateData.orderStatus).toUpperCase().replace(/\s+/g, '_');
@@ -1875,6 +1901,7 @@ app.put('/api/orders/:id', authenticateAdmin, async (req, res) => {
       newStatus = 'SHIPPED';
     }
     updateData.status = newStatus;
+    const statusChanged = newStatus !== existingOrder.status;
 
     if (updateData.paymentStatus) {
       updateData.paymentStatus = String(updateData.paymentStatus).toUpperCase();
@@ -1885,20 +1912,6 @@ app.put('/api/orders/:id', authenticateAdmin, async (req, res) => {
     }
     if (newStatus === 'DELIVERED' && !existingOrder.deliveredAt) {
       updateData.deliveredAt = new Date();
-    }
-
-    // ─── Email Notifications (always fire on status change, no tracking URL required) ───
-    if (newStatus === 'SHIPPED') {
-      sendOrderStatusEmail(existingOrder, 'SHIPPED', validatedTrackingUrl || null)
-        .catch((e) => console.warn('[Order Shipped Email Error]:', e.message));
-    }
-    if (newStatus === 'OUT_FOR_DELIVERY') {
-      sendOrderStatusEmail(existingOrder, 'OUT_FOR_DELIVERY', validatedTrackingUrl || null)
-        .catch((e) => console.warn('[Order OFD Email Error]:', e.message));
-    }
-    if (newStatus === 'DELIVERED') {
-      sendOrderStatusEmail(existingOrder, 'DELIVERED')
-        .catch((e) => console.warn('[Order Delivered Email Error]:', e.message));
     }
 
     // ─── WhatsApp Notification (only when tracking URL is provided) ───
@@ -1967,6 +1980,24 @@ app.put('/api/orders/:id', authenticateAdmin, async (req, res) => {
       data: cleanDbUpdateData,
       select: SAFE_ORDER_SELECT
     });
+
+    // Email only after the database transition succeeds; repeated saves of the
+    // same status do not produce another notification.
+    if (statusChanged && (newStatus === 'SHIPPED' || newStatus === 'DELIVERED')) {
+      const emailStatus = newStatus === 'DELIVERED'
+        ? 'DELIVERED'
+        : requestedStatusNormalized === 'OUT_FOR_DELIVERY'
+          ? 'OUT_FOR_DELIVERY'
+          : 'SHIPPED';
+      const emailResult = await sendOrderStatusEmail(
+        order,
+        emailStatus,
+        emailStatus === 'DELIVERED' ? null : validatedTrackingUrl || null
+      );
+      if (!emailResult.success) {
+        console.error(`EMAIL_SEND_FAILED type=order_status_${emailStatus.toLowerCase()} orderNumber=${order.orderNumber} recipient=${order.customer?.email || 'none'} reason=${emailResult.reason || emailResult.error || 'unknown reason'}`);
+      }
+    }
 
     const mappedOrder = mapOrderForFrontend(order, true);
     if (notificationResult) {
@@ -3372,4 +3403,4 @@ app.get('/api/admin/payment-gateway-status', authenticateAdmin, async (req, res)
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch payment gateway status', details: error.message });
   }
-});
+});
